@@ -24,6 +24,7 @@ State:
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,11 @@ SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
 
 EMBED_COLOR_EVOLUTION = 0x5865F2  # discord blurple
 EMBED_COLOR_SBC = 0x57F287  # green
+
+# Discord webhooks are rate-limited (~5 requests per 2 seconds). Posting a
+# batch of new items back-to-back with no pause can trip that limit and
+# Discord will reject the message. This is the pause between each post.
+POST_DELAY_SECONDS = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +164,7 @@ def evolution_embed(item: dict) -> dict:
     description = name_line + (evo.get("description") or "")
 
     embed = {
-        "title": evo.get("name", "New Evolution"),
-        "url": f"{FUTGG_BASE}{evo['url']}" if evo.get("url") else None,
+        "title": (evo.get("name") or "New Evolution")[:256],
         "description": description[:4000],
         "color": EMBED_COLOR_EVOLUTION,
         "fields": [
@@ -186,11 +191,25 @@ def evolution_embed(item: dict) -> dict:
             },
         ],
     }
+    if evo.get("url"):
+        embed["url"] = f"{FUTGG_BASE}{evo['url']}"
     if upgraded.get("cardImageUrl"):
         embed["image"] = {"url": upgraded["cardImageUrl"]}
     if base.get("cardImageUrl"):
         embed["thumbnail"] = {"url": base["cardImageUrl"]}
     return embed
+
+
+def sbc_image_url(sbc: dict) -> str | None:
+    """SBCs sometimes have their own image, otherwise fall back to the
+    first reward's player card image (fut.gg does the same on its own
+    SBC listing)."""
+    if sbc.get("imageUrl"):
+        return sbc["imageUrl"]
+    awards = sbc.get("awards") or []
+    if awards and awards[0].get("player") and awards[0]["player"].get("cardImageUrl"):
+        return awards[0]["player"]["cardImageUrl"]
+    return None
 
 
 def sbc_embed(sbc: dict) -> dict:
@@ -202,8 +221,7 @@ def sbc_embed(sbc: dict) -> dict:
     cost_text = " / ".join(cost_bits) if cost_bits else "Unknown"
 
     embed = {
-        "title": sbc.get("name", "New SBC"),
-        "url": f"{FUTGG_BASE}{sbc['url']}" if sbc.get("url") else None,
+        "title": (sbc.get("name") or "New SBC")[:256],
         "description": (sbc.get("description") or "")[:4000],
         "color": EMBED_COLOR_SBC,
         "fields": [
@@ -220,6 +238,11 @@ def sbc_embed(sbc: dict) -> dict:
             },
         ],
     }
+    if sbc.get("url"):
+        embed["url"] = f"{FUTGG_BASE}{sbc['url']}"
+    image_url = sbc_image_url(sbc)
+    if image_url:
+        embed["image"] = {"url": image_url}
     return embed
 
 
@@ -227,15 +250,42 @@ def sbc_embed(sbc: dict) -> dict:
 # Discord posting
 # ---------------------------------------------------------------------------
 
-def post_webhook(webhook_url: str, content: str, embed: dict) -> None:
+def post_webhook(webhook_url: str, content: str, embed: dict, max_retries: int = 3) -> bool:
+    """Post one message to a Discord webhook. Returns True on success, False
+    on failure (after retries) -- never raises, so one bad item can't kill
+    the rest of the run."""
     if not webhook_url:
         print("  (no webhook URL configured, skipping post)")
-        return
+        return False
+
     payload = {"content": content, "embeds": [embed]}
-    resp = requests.post(webhook_url, json=payload, timeout=30)
-    if resp.status_code >= 300:
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(webhook_url, json=payload, timeout=30)
+        except requests.RequestException as e:
+            print(f"  ! network error posting to Discord: {e}")
+            return False
+
+        if resp.status_code == 429:
+            # Rate limited. Discord tells us how long to wait.
+            try:
+                retry_after = resp.json().get("retry_after", 2)
+            except ValueError:
+                retry_after = float(resp.headers.get("Retry-After", 2))
+            retry_after = float(retry_after) + 0.5
+            print(f"  rate limited, waiting {retry_after:.1f}s (attempt {attempt}/{max_retries})")
+            time.sleep(retry_after)
+            continue
+
+        if 200 <= resp.status_code < 300:
+            return True
+
         print(f"  ! Discord webhook error {resp.status_code}: {resp.text[:300]}")
-    resp.raise_for_status()
+        return False
+
+    print("  ! gave up after repeated rate limiting")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -274,28 +324,54 @@ def main() -> int:
         print(f"First run: seeding {len(sbcs)} SBCs without posting.")
         new_sbcs = []
 
-    for item in new_evolutions:
+    failed_evo_ids = set()
+    posted_evo_count = 0
+    for i, item in enumerate(new_evolutions):
         evo = item["evolution"]
         print(f"Posting new evolution: {evo['name']}")
-        post_webhook(
+        ok = post_webhook(
             EVOLUTIONS_WEBHOOK_URL,
             "New evolution(s) added! \U0001F6A8",
             evolution_embed(item),
         )
+        if ok:
+            posted_evo_count += 1
+        else:
+            failed_evo_ids.add(evo["id"])
+            print(f"  will retry '{evo['name']}' on the next run")
+        if i < len(new_evolutions) - 1:
+            time.sleep(POST_DELAY_SECONDS)
 
-    for sbc in new_sbcs:
+    failed_sbc_ids = set()
+    posted_sbc_count = 0
+    for i, sbc in enumerate(new_sbcs):
         print(f"Posting new SBC: {sbc['name']}")
-        post_webhook(
+        ok = post_webhook(
             SBC_WEBHOOK_URL,
             "New SBC(s) added! \U0001F6A8",
             sbc_embed(sbc),
         )
+        if ok:
+            posted_sbc_count += 1
+        else:
+            failed_sbc_ids.add(sbc["id"])
+            print(f"  will retry '{sbc['name']}' on the next run")
+        if i < len(new_sbcs) - 1:
+            time.sleep(POST_DELAY_SECONDS)
 
-    state["evolutions_seen"] = sorted({e["evolution"]["id"] for e in evolutions} | seen_evo_ids)
-    state["sbcs_seen"] = sorted({s["id"] for s in sbcs} | seen_sbc_ids)
+    # Mark everything currently live as seen EXCEPT items whose post failed --
+    # those stay unseen so they get retried automatically on the next run
+    # instead of silently vanishing.
+    all_evo_ids = {e["evolution"]["id"] for e in evolutions}
+    all_sbc_ids = {s["id"] for s in sbcs}
+    state["evolutions_seen"] = sorted((seen_evo_ids | all_evo_ids) - failed_evo_ids)
+    state["sbcs_seen"] = sorted((seen_sbc_ids | all_sbc_ids) - failed_sbc_ids)
     save_state(state)
 
-    print(f"Done. Posted {len(new_evolutions)} evolution(s), {len(new_sbcs)} SBC(s).")
+    print(
+        f"Done. Posted {posted_evo_count}/{len(new_evolutions)} evolution(s), "
+        f"{posted_sbc_count}/{len(new_sbcs)} SBC(s)."
+    )
     return 0
 
 
