@@ -1,24 +1,29 @@
 """
 fut.gg -> Discord notifier
 
-Checks fut.gg for newly-added Evolutions and SBCs and posts them to two
-separate Discord webhooks. Designed to run on a schedule (see
+Checks fut.gg for newly-added Evolutions, SBCs, and Objectives, and posts
+each to its own Discord webhook. Designed to run on a schedule (see
 .github/workflows/check.yml) via GitHub Actions, but works fine run locally
 too.
 
 How it gets data:
   fut.gg is a client-rendered app (TanStack Start) that embeds its page data
   in a global `window.__TSR_ROUTER__` object once loaded. There's no public
-  JSON API, so this script uses Playwright (headless Chromium) to load the
+  JSON API, so this script uses Playwright (headless Chromium) to load each
   page for real and pull the data out of that object directly -- the exact
   same data structure the site itself renders from.
 
 State:
-  Previously-seen Evolution/SBC ids are stored in state/state.json. On the
-  very first run (no state file yet), the script seeds the file with
-  everything currently live WITHOUT posting -- otherwise you'd get 200+
-  messages dumped into your channel on the first run. Every run after that
-  only posts genuinely new items.
+  Previously-seen ids for each category are stored in state/state.json. On
+  the very first run (no ids recorded yet for a category), the script seeds
+  the file with everything currently live WITHOUT posting -- otherwise
+  you'd get 200+ messages dumped into your channel on the first run. Every
+  run after that only posts genuinely new items.
+
+Rate limiting:
+  Discord webhooks reject requests sent too fast (~5 per 2 seconds). Posts
+  are spaced out with a short delay, and a 429 (rate limited) response is
+  retried automatically rather than treated as a failure.
 """
 
 import json
@@ -34,19 +39,24 @@ from playwright.sync_api import sync_playwright
 FUTGG_BASE = "https://www.fut.gg"
 EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/"
 SBC_URL = f"{FUTGG_BASE}/sbc/"
+OBJECTIVES_URL = f"{FUTGG_BASE}/objectives/"
 
 STATE_PATH = Path(__file__).parent / "state" / "state.json"
 
 EVOLUTIONS_WEBHOOK_URL = os.environ.get("EVOLUTIONS_WEBHOOK_URL", "")
 SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
+OBJECTIVES_WEBHOOK_URL = os.environ.get("OBJECTIVES_WEBHOOK_URL", "")
 
 EMBED_COLOR_EVOLUTION = 0x5865F2  # discord blurple
 EMBED_COLOR_SBC = 0x57F287  # green
+EMBED_COLOR_OBJECTIVE = 0xFEE75C  # yellow
 
 # Discord webhooks are rate-limited (~5 requests per 2 seconds). Posting a
 # batch of new items back-to-back with no pause can trip that limit and
 # Discord will reject the message. This is the pause between each post.
 POST_DELAY_SECONDS = 1.5
+
+DEFAULT_STATE = {"evolutions_seen": [], "sbcs_seen": [], "objectives_seen": []}
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +64,10 @@ POST_DELAY_SECONDS = 1.5
 # ---------------------------------------------------------------------------
 
 def load_state() -> dict:
+    state = dict(DEFAULT_STATE)
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {"evolutions_seen": [], "sbcs_seen": []}
+        state.update(json.loads(STATE_PATH.read_text()))
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -92,6 +103,21 @@ def fetch_sbcs(page) -> list[dict]:
                 m => m.id === '/sbc/_sbcListLayout'
             );
             return m ? m.loaderData.allSbcs : [];
+        }
+        """
+    )
+    return data or []
+
+
+def fetch_objectives(page) -> list[dict]:
+    page.goto(OBJECTIVES_URL, wait_until="networkidle")
+    data = page.evaluate(
+        """
+        () => {
+            const m = window.__TSR_ROUTER__.state.matches.find(
+                m => m.id === '/objectives/_list/_withObjectives'
+            );
+            return m ? m.loaderData.allObjectives : [];
         }
         """
     )
@@ -246,6 +272,50 @@ def sbc_embed(sbc: dict) -> dict:
     return embed
 
 
+def objective_image_url(obj: dict) -> str | None:
+    """Objectives don't have their own artwork -- use the first reward's
+    player card image, same idea as the SBC fallback."""
+    awards = obj.get("awards") or []
+    if not awards:
+        return None
+    first = awards[0]
+    if first.get("imageUrl"):
+        return first["imageUrl"]
+    player_item = first.get("playerItem")
+    if player_item and player_item.get("cardImageUrl"):
+        return player_item["cardImageUrl"]
+    return None
+
+
+def objective_embed(obj: dict) -> dict:
+    category = (obj.get("category") or {}).get("name", "Objective")
+
+    embed = {
+        "title": (obj.get("name") or "New Objective")[:256],
+        "description": (obj.get("description") or "")[:4000],
+        "color": EMBED_COLOR_OBJECTIVE,
+        "fields": [
+            {"name": "Category", "value": category, "inline": True},
+            {
+                "name": "Tasks",
+                "value": str(obj.get("tasksCount", "?")),
+                "inline": True,
+            },
+            {
+                "name": "Expires",
+                "value": relative_days(obj.get("endTime")),
+                "inline": True,
+            },
+        ],
+    }
+    if obj.get("slug"):
+        embed["url"] = f"{FUTGG_BASE}/objectives/{obj['slug']}/"
+    image_url = objective_image_url(obj)
+    if image_url:
+        embed["image"] = {"url": image_url}
+    return embed
+
+
 # ---------------------------------------------------------------------------
 # Discord posting
 # ---------------------------------------------------------------------------
@@ -289,13 +359,53 @@ def post_webhook(webhook_url: str, content: str, embed: dict, max_retries: int =
 
 
 # ---------------------------------------------------------------------------
+# Generic per-category pipeline (shared by evolutions / SBCs / objectives)
+# ---------------------------------------------------------------------------
+
+def process_category(
+    label: str,
+    items: list[dict],
+    get_id,
+    get_name,
+    embed_fn,
+    webhook_url: str,
+    announce_text: str,
+    seen_ids: set,
+) -> set:
+    """Diffs `items` against `seen_ids`, posts anything new to `webhook_url`,
+    and returns the updated set of seen ids (failed posts are left out so
+    they're retried on the next run)."""
+    first_run = not seen_ids
+    all_ids = {get_id(item) for item in items}
+    new_items = [] if first_run else [i for i in items if get_id(i) not in seen_ids]
+
+    if first_run:
+        print(f"First run for {label}: seeding {len(items)} item(s) without posting.")
+
+    failed_ids = set()
+    posted_count = 0
+    for i, item in enumerate(new_items):
+        name = get_name(item)
+        print(f"Posting new {label[:-1] if label.endswith('s') else label}: {name}")
+        ok = post_webhook(webhook_url, announce_text, embed_fn(item))
+        if ok:
+            posted_count += 1
+        else:
+            failed_ids.add(get_id(item))
+            print(f"  will retry '{name}' on the next run")
+        if i < len(new_items) - 1:
+            time.sleep(POST_DELAY_SECONDS)
+
+    print(f"{label}: posted {posted_count}/{len(new_items)}.")
+    return (seen_ids | all_ids) - failed_ids
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> int:
     state = load_state()
-    first_run_evos = not state["evolutions_seen"]
-    first_run_sbcs = not state["sbcs_seen"]
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -309,69 +419,53 @@ def main() -> int:
         sbcs = fetch_sbcs(page)
         print(f"  found {len(sbcs)} live SBCs")
 
+        print("Fetching objectives from fut.gg...")
+        objectives = fetch_objectives(page)
+        print(f"  found {len(objectives)} live objectives")
+
         browser.close()
 
-    seen_evo_ids = set(state["evolutions_seen"])
-    seen_sbc_ids = set(state["sbcs_seen"])
-
-    new_evolutions = [e for e in evolutions if e["evolution"]["id"] not in seen_evo_ids]
-    new_sbcs = [s for s in sbcs if s["id"] not in seen_sbc_ids]
-
-    if first_run_evos:
-        print(f"First run: seeding {len(evolutions)} evolutions without posting.")
-        new_evolutions = []
-    if first_run_sbcs:
-        print(f"First run: seeding {len(sbcs)} SBCs without posting.")
-        new_sbcs = []
-
-    failed_evo_ids = set()
-    posted_evo_count = 0
-    for i, item in enumerate(new_evolutions):
-        evo = item["evolution"]
-        print(f"Posting new evolution: {evo['name']}")
-        ok = post_webhook(
-            EVOLUTIONS_WEBHOOK_URL,
-            "New evolution(s) added! \U0001F6A8",
-            evolution_embed(item),
+    state["evolutions_seen"] = sorted(
+        process_category(
+            "evolutions",
+            evolutions,
+            get_id=lambda item: item["evolution"]["id"],
+            get_name=lambda item: item["evolution"]["name"],
+            embed_fn=evolution_embed,
+            webhook_url=EVOLUTIONS_WEBHOOK_URL,
+            announce_text="New evolution(s) added! \U0001F6A8",
+            seen_ids=set(state["evolutions_seen"]),
         )
-        if ok:
-            posted_evo_count += 1
-        else:
-            failed_evo_ids.add(evo["id"])
-            print(f"  will retry '{evo['name']}' on the next run")
-        if i < len(new_evolutions) - 1:
-            time.sleep(POST_DELAY_SECONDS)
-
-    failed_sbc_ids = set()
-    posted_sbc_count = 0
-    for i, sbc in enumerate(new_sbcs):
-        print(f"Posting new SBC: {sbc['name']}")
-        ok = post_webhook(
-            SBC_WEBHOOK_URL,
-            "New SBC(s) added! \U0001F6A8",
-            sbc_embed(sbc),
-        )
-        if ok:
-            posted_sbc_count += 1
-        else:
-            failed_sbc_ids.add(sbc["id"])
-            print(f"  will retry '{sbc['name']}' on the next run")
-        if i < len(new_sbcs) - 1:
-            time.sleep(POST_DELAY_SECONDS)
-
-    # Mark everything currently live as seen EXCEPT items whose post failed --
-    # those stay unseen so they get retried automatically on the next run
-    # instead of silently vanishing.
-    all_evo_ids = {e["evolution"]["id"] for e in evolutions}
-    all_sbc_ids = {s["id"] for s in sbcs}
-    state["evolutions_seen"] = sorted((seen_evo_ids | all_evo_ids) - failed_evo_ids)
-    state["sbcs_seen"] = sorted((seen_sbc_ids | all_sbc_ids) - failed_sbc_ids)
-    save_state(state)
-
-    print(
-        f"Done. Posted {posted_evo_count}/{len(new_evolutions)} evolution(s), "
-        f"{posted_sbc_count}/{len(new_sbcs)} SBC(s)."
     )
+
+    state["sbcs_seen"] = sorted(
+        process_category(
+            "sbcs",
+            sbcs,
+            get_id=lambda item: item["id"],
+            get_name=lambda item: item["name"],
+            embed_fn=sbc_embed,
+            webhook_url=SBC_WEBHOOK_URL,
+            announce_text="New SBC(s) added! \U0001F6A8",
+            seen_ids=set(state["sbcs_seen"]),
+        )
+    )
+
+    state["objectives_seen"] = sorted(
+        process_category(
+            "objectives",
+            objectives,
+            get_id=lambda item: item["id"],
+            get_name=lambda item: item["name"],
+            embed_fn=objective_embed,
+            webhook_url=OBJECTIVES_WEBHOOK_URL,
+            announce_text="New objective(s) added! \U0001F6A8",
+            seen_ids=set(state["objectives_seen"]),
+        )
+    )
+
+    save_state(state)
+    print("Done.")
     return 0
 
 
