@@ -24,10 +24,27 @@ Rate limiting:
   Discord webhooks reject requests sent too fast (~5 per 2 seconds). Posts
   are spaced out with a short delay, and a 429 (rate limited) response is
   retried automatically rather than treated as a failure.
+
+Role pings:
+  Setting EVOLUTIONS_ROLE_ID / SBC_ROLE_ID / OBJECTIVES_ROLE_ID pings that
+  role at the start of the announcement message (e.g. so your "New SBC"
+  reaction-role members get notified). Leave any of them unset to post
+  without a ping for that category.
+
+Trending / best evolved players:
+  fut.gg's /evolutions/best/ page lists the highest meta-rated PLAYER cards
+  you can currently build through Evolutions (e.g. "Doumbia -- 97.1 meta
+  rating"), ranked best-first. For each of the top players in that list, we
+  look up their best evolution path (fut.gg's paths API, which returns every
+  possible chain for a base card ranked best-first) to get the exact meta
+  rating, the evolution chain used to reach it, and card art. Anything newly
+  in that top ranking gets posted to a separate "trending" webhook, best
+  meta rating first.
 """
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -40,23 +57,60 @@ FUTGG_BASE = "https://www.fut.gg"
 EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/"
 SBC_URL = f"{FUTGG_BASE}/sbc/"
 OBJECTIVES_URL = f"{FUTGG_BASE}/objectives/"
+BEST_EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/best/"
+# Every possible evolution-chain ("path") for a given base card, ranked
+# best-meta-rating-first by fut.gg. {base_ea_id} is the root/un-evolved
+# card's EA id.
+PATHS_API = f"{FUTGG_BASE}/api/fut/evolutions/v2/26/paths/v2/{{base_ea_id}}/"
+# How many of the top-ranked "best evolution players" to track/post per run.
+TRENDING_TOP_N = 20
+# Never post a trending player below this GG (meta) rating, even if they'd
+# otherwise fall within the top N.
+MIN_TRENDING_GG_RATING = 93.0
 
 STATE_PATH = Path(__file__).parent / "state" / "state.json"
 
 EVOLUTIONS_WEBHOOK_URL = os.environ.get("EVOLUTIONS_WEBHOOK_URL", "")
 SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
 OBJECTIVES_WEBHOOK_URL = os.environ.get("OBJECTIVES_WEBHOOK_URL", "")
+TRENDING_EVOLUTIONS_WEBHOOK_URL = os.environ.get("TRENDING_EVOLUTIONS_WEBHOOK_URL", "")
+
+# Optional: Discord role IDs to @-mention when posting. If left blank, the
+# post still goes out, just without a role ping. These correspond to the
+# "New Evolution" / "New SBC" / "New Objective" reaction roles.
+EVOLUTIONS_ROLE_ID = os.environ.get("EVOLUTIONS_ROLE_ID", "")
+SBC_ROLE_ID = os.environ.get("SBC_ROLE_ID", "")
+OBJECTIVES_ROLE_ID = os.environ.get("OBJECTIVES_ROLE_ID", "")
+TRENDING_EVOLUTIONS_ROLE_ID = os.environ.get("TRENDING_EVOLUTIONS_ROLE_ID", "")
 
 EMBED_COLOR_EVOLUTION = 0x5865F2  # discord blurple
 EMBED_COLOR_SBC = 0x57F287  # green
 EMBED_COLOR_OBJECTIVE = 0xFEE75C  # yellow
+EMBED_COLOR_TRENDING = 0xFF6600  # orange
 
 # Discord webhooks are rate-limited (~5 requests per 2 seconds). Posting a
 # batch of new items back-to-back with no pause can trip that limit and
 # Discord will reject the message. This is the pause between each post.
 POST_DELAY_SECONDS = 1.5
 
-DEFAULT_STATE = {"evolutions_seen": [], "sbcs_seen": [], "objectives_seen": []}
+DEFAULT_STATE = {
+    "evolutions_seen": [],
+    "sbcs_seen": [],
+    "objectives_seen": [],
+    # Base player ids currently in fut.gg's "best evolution players" top
+    # ranking as of the last run. This is a snapshot, not an ever-growing
+    # set -- a player that rotates out of the ranking and later comes back
+    # in will get posted again, since it's a genuinely new appearance on
+    # the leaderboard.
+    "trending_evolutions_seen": [],
+}
+
+
+def role_mention(role_id: str) -> str:
+    """Returns a Discord role-mention prefix (with trailing space) if a role
+    id is configured, otherwise an empty string so the post still goes out
+    without a ping."""
+    return f"<@&{role_id}> " if role_id else ""
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +176,72 @@ def fetch_objectives(page) -> list[dict]:
         """
     )
     return data or []
+
+
+def path_card_image_url(step: dict) -> str | None:
+    p = step.get("futggCardImagePath") or step.get("cardImagePath")
+    if not p:
+        return None
+    return f"https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=300/{p}"
+
+
+def fetch_best_evolution_players(page, limit: int = TRENDING_TOP_N) -> list[dict]:
+    """fut.gg's /evolutions/best/ page ranks the highest meta-rated PLAYER
+    cards buildable through Evolutions right now, best first. The page only
+    gives us name + a link to that player's evolutions page in its embedded
+    data, so for each of the top `limit` players we pull their EA id out of
+    that link and look up their single best evolution path (fut.gg ranks a
+    player's paths best-meta-rating-first) to get the exact rating, the
+    evolution chain used, and card art."""
+    page.goto(BEST_EVOLUTIONS_URL, wait_until="networkidle")
+    player_items = page.evaluate(
+        """
+        () => {
+            const m = window.__TSR_ROUTER__.state.matches.find(
+                m => m.id === '/evolutions/best'
+            );
+            return m ? m.loaderData.playerItems : [];
+        }
+        """
+    ) or []
+
+    results = []
+    for item in player_items[:limit]:
+        match = re.match(r"/players/(\d+)-", item.get("url") or "")
+        if not match:
+            continue
+        base_ea_id = int(match.group(1))
+
+        paths_result = page.evaluate(
+            """
+            async (url) => {
+                const r = await fetch(url);
+                if (!r.ok) return null;
+                return r.json();
+            }
+            """,
+            PATHS_API.format(base_ea_id=base_ea_id),
+        )
+        if not paths_result or not paths_result.get("data"):
+            continue
+
+        best_path = paths_result["data"][0]
+        final_step = best_path["path"][-1]
+        gg_rating = final_step.get("ggRating")
+        if gg_rating is not None and gg_rating < MIN_TRENDING_GG_RATING:
+            continue
+        results.append(
+            {
+                "id": base_ea_id,
+                "name": item.get("name") or player_name(final_step),
+                "ggRating": gg_rating,
+                "overall": final_step.get("overall"),
+                "evoNames": [e["name"] for e in (best_path.get("evolutions") or [])],
+                "cardImageUrl": path_card_image_url(final_step),
+                "url": f"{FUTGG_BASE}{item['url']}" if item.get("url") else None,
+            }
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +343,32 @@ def evolution_embed(item: dict) -> dict:
         embed["image"] = {"url": upgraded["cardImageUrl"]}
     if base.get("cardImageUrl"):
         embed["thumbnail"] = {"url": base["cardImageUrl"]}
+    return embed
+
+
+def trending_player_embed(entry: dict, rank: int) -> dict:
+    """`entry` is one item built by fetch_best_evolution_players() -- a real
+    evolved player card, its meta rating, and the evolution chain used to
+    reach it."""
+    gg = entry.get("ggRating")
+    gg_text = f"{gg:.1f}" if isinstance(gg, (int, float)) else "Unknown"
+    chain = " → ".join(entry.get("evoNames") or [])
+
+    embed = {
+        "title": f"{entry.get('name', 'Unknown')} — {entry.get('overall', '?')} OVR"[:256],
+        "description": f"Ranked **#{rank}** highest meta-rated evolution player right now.",
+        "color": EMBED_COLOR_TRENDING,
+        "fields": [
+            {"name": "Meta Rating", "value": gg_text, "inline": True},
+            {"name": "Final Rating", "value": str(entry.get("overall", "?")), "inline": True},
+            {"name": "Evolutions Used", "value": str(len(entry.get("evoNames") or [])), "inline": True},
+            {"name": "Evolution Path", "value": chain or "Unknown", "inline": False},
+        ],
+    }
+    if entry.get("url"):
+        embed["url"] = entry["url"]
+    if entry.get("cardImageUrl"):
+        embed["image"] = {"url": entry["cardImageUrl"]}
     return embed
 
 
@@ -328,7 +474,14 @@ def post_webhook(webhook_url: str, content: str, embed: dict, max_retries: int =
         print("  (no webhook URL configured, skipping post)")
         return False
 
-    payload = {"content": content, "embeds": [embed]}
+    payload = {
+        "content": content,
+        "embeds": [embed],
+        # Explicitly allow role pings in the content. Webhooks can ping a
+        # role via this even if that role's own "Allow anyone to @mention
+        # this role" setting is off.
+        "allowed_mentions": {"parse": ["roles"]},
+    }
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -423,7 +576,34 @@ def main() -> int:
         objectives = fetch_objectives(page)
         print(f"  found {len(objectives)} live objectives")
 
+        print("Fetching best/trending evolved players from fut.gg...")
+        best_players = fetch_best_evolution_players(page)
+        print(f"  found {len(best_players)} ranked entries")
+
         browser.close()
+
+    # Trending / best evolved players leaderboard -- post whatever just
+    # entered the top ranking since last run, best meta rating first,
+    # picture + evolution path chain included.
+    trending_seen_before = set(state.get("trending_evolutions_seen", []))
+    if not trending_seen_before:
+        print(f"First run for trending evolved players: seeding top {len(best_players)} without posting.")
+    else:
+        new_entries = [
+            (rank, entry) for rank, entry in enumerate(best_players, start=1) if entry["id"] not in trending_seen_before
+        ]
+        if new_entries:
+            print(f"Posting {len(new_entries)} newly-ranked trending player(s)...")
+        for i, (rank, entry) in enumerate(new_entries):
+            print(f"Posting trending player: {entry.get('name')} (rank {rank}, {entry.get('ggRating')} meta rating)")
+            post_webhook(
+                TRENDING_EVOLUTIONS_WEBHOOK_URL,
+                f"{role_mention(TRENDING_EVOLUTIONS_ROLE_ID)}\U0001F525 New top evolved player -- {entry.get('ggRating', '?')} meta rating!",
+                trending_player_embed(entry, rank),
+            )
+            if i < len(new_entries) - 1:
+                time.sleep(POST_DELAY_SECONDS)
+    state["trending_evolutions_seen"] = [e["id"] for e in best_players]
 
     state["evolutions_seen"] = sorted(
         process_category(
@@ -433,7 +613,7 @@ def main() -> int:
             get_name=lambda item: item["evolution"]["name"],
             embed_fn=evolution_embed,
             webhook_url=EVOLUTIONS_WEBHOOK_URL,
-            announce_text="New evolution(s) added! \U0001F6A8",
+            announce_text=f"{role_mention(EVOLUTIONS_ROLE_ID)}New evolution(s) added! \U0001F6A8",
             seen_ids=set(state["evolutions_seen"]),
         )
     )
@@ -446,7 +626,7 @@ def main() -> int:
             get_name=lambda item: item["name"],
             embed_fn=sbc_embed,
             webhook_url=SBC_WEBHOOK_URL,
-            announce_text="New SBC(s) added! \U0001F6A8",
+            announce_text=f"{role_mention(SBC_ROLE_ID)}New SBC(s) added! \U0001F6A8",
             seen_ids=set(state["sbcs_seen"]),
         )
     )
@@ -459,7 +639,7 @@ def main() -> int:
             get_name=lambda item: item["name"],
             embed_fn=objective_embed,
             webhook_url=OBJECTIVES_WEBHOOK_URL,
-            announce_text="New objective(s) added! \U0001F6A8",
+            announce_text=f"{role_mention(OBJECTIVES_ROLE_ID)}New objective(s) added! \U0001F6A8",
             seen_ids=set(state["objectives_seen"]),
         )
     )
