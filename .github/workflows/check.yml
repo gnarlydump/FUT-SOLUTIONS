@@ -32,6 +32,9 @@ jobs:
           EVOLUTIONS_WEBHOOK_URL: ${{ secrets.EVOLUTIONS_WEBHOOK_URL }}
           SBC_WEBHOOK_URL: ${{ secrets.SBC_WEBHOOK_URL }}
           OBJECTIVES_WEBHOOK_URL: ${{ secrets.OBJECTIVES_WEBHOOK_URL }}
+          EVOLUTIONS_ROLE_ID: ${{ secrets.EVOLUTIONS_ROLE_ID }}
+          SBC_ROLE_ID: ${{ secrets.SBC_ROLE_ID }}
+          OBJECTIVES_ROLE_ID: ${{ secrets.OBJECTIVES_ROLE_ID }}
         run: python bot.py
 
       - name: Commit updated state
