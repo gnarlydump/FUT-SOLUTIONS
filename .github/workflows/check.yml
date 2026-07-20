@@ -2,11 +2,13 @@ name: Check fut.gg for new evolutions and SBCs
 
 on:
   schedule:
+    # Runs at the top of every hour (GitHub may delay this by a few minutes
+    # during busy periods -- that's normal for scheduled Actions).
     - cron: "0 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
 permissions:
-  contents: write
+  contents: write  # needed so the workflow can commit the updated state file
 
 jobs:
   check:
@@ -29,6 +31,7 @@ jobs:
         env:
           EVOLUTIONS_WEBHOOK_URL: ${{ secrets.EVOLUTIONS_WEBHOOK_URL }}
           SBC_WEBHOOK_URL: ${{ secrets.SBC_WEBHOOK_URL }}
+          OBJECTIVES_WEBHOOK_URL: ${{ secrets.OBJECTIVES_WEBHOOK_URL }}
         run: python bot.py
 
       - name: Commit updated state
