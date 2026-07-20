@@ -77,6 +77,38 @@ For each channel:
 
 After that, it runs automatically every hour on its own.
 
+### 5. (Optional) Ping a role when something new posts
+
+If you set up the "New Evolution" / "New SBC" / "New Objective" reaction
+roles, the bot can @-mention that role in the announcement message.
+
+1. In Discord, enable **Developer Mode**: User Settings → Advanced → Developer Mode.
+2. Server Settings → Roles → right-click a role (e.g. "New SBC") → **Copy Role ID**.
+3. Repeat for each role you want pinged.
+4. Back in your GitHub repo (**Settings → Secrets and variables → Actions**), add:
+   - `EVOLUTIONS_ROLE_ID`
+   - `SBC_ROLE_ID`
+   - `OBJECTIVES_ROLE_ID`
+
+   Only add the ones you want — any left unset just post without a ping,
+   nothing breaks.
+5. No extra Discord permission changes needed — the bot sends
+   `allowed_mentions` explicitly, so the ping works even if the role's own
+   "Allow anyone to @mention this role" setting is off.
+
+### 6. (Optional) Trending evolved players channel
+
+fut.gg ranks the highest meta-rated player cards you can currently build
+through Evolutions (its "Best Evolution Players" list). If you set up a
+`TRENDING_EVOLUTIONS_WEBHOOK_URL` secret, the bot posts whatever newly
+enters that top-10 ranking each run -- highest meta rating first, with a
+picture, the meta rating, and the exact evolution chain (path) used to
+reach it.
+
+1. Create a Discord webhook for this channel the same way as step 1.
+2. Add it as a repo secret named `TRENDING_EVOLUTIONS_WEBHOOK_URL`.
+3. Optionally add `TRENDING_EVOLUTIONS_ROLE_ID` the same way as the other role IDs in step 5, if you want a role pinged for this channel too.
+
 ## Customizing
 
 - **Frequency:** edit the `cron` line in `.github/workflows/check.yml`
