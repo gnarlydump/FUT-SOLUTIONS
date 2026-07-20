@@ -24,12 +24,6 @@ Rate limiting:
   Discord webhooks reject requests sent too fast (~5 per 2 seconds). Posts
   are spaced out with a short delay, and a 429 (rate limited) response is
   retried automatically rather than treated as a failure.
-
-Role pings:
-  Setting EVOLUTIONS_ROLE_ID / SBC_ROLE_ID / OBJECTIVES_ROLE_ID pings that
-  role at the start of the announcement message (e.g. so your "New SBC"
-  reaction-role members get notified). Leave any of them unset to post
-  without a ping for that category.
 """
 
 import json
@@ -53,13 +47,6 @@ EVOLUTIONS_WEBHOOK_URL = os.environ.get("EVOLUTIONS_WEBHOOK_URL", "")
 SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
 OBJECTIVES_WEBHOOK_URL = os.environ.get("OBJECTIVES_WEBHOOK_URL", "")
 
-# Optional: Discord role IDs to @-mention when posting. If left blank, the
-# post still goes out, just without a role ping. These correspond to the
-# "New Evolution" / "New SBC" / "New Objective" reaction roles.
-EVOLUTIONS_ROLE_ID = os.environ.get("EVOLUTIONS_ROLE_ID", "")
-SBC_ROLE_ID = os.environ.get("SBC_ROLE_ID", "")
-OBJECTIVES_ROLE_ID = os.environ.get("OBJECTIVES_ROLE_ID", "")
-
 EMBED_COLOR_EVOLUTION = 0x5865F2  # discord blurple
 EMBED_COLOR_SBC = 0x57F287  # green
 EMBED_COLOR_OBJECTIVE = 0xFEE75C  # yellow
@@ -69,18 +56,7 @@ EMBED_COLOR_OBJECTIVE = 0xFEE75C  # yellow
 # Discord will reject the message. This is the pause between each post.
 POST_DELAY_SECONDS = 1.5
 
-DEFAULT_STATE = {
-    "evolutions_seen": [],
-    "sbcs_seen": [],
-    "objectives_seen": [],
-}
-
-
-def role_mention(role_id: str) -> str:
-    """Returns a Discord role-mention prefix (with trailing space) if a role
-    id is configured, otherwise an empty string so the post still goes out
-    without a ping."""
-    return f"<@&{role_id}> " if role_id else ""
+DEFAULT_STATE = {"evolutions_seen": [], "sbcs_seen": [], "objectives_seen": []}
 
 
 # ---------------------------------------------------------------------------
@@ -352,14 +328,7 @@ def post_webhook(webhook_url: str, content: str, embed: dict, max_retries: int =
         print("  (no webhook URL configured, skipping post)")
         return False
 
-    payload = {
-        "content": content,
-        "embeds": [embed],
-        # Explicitly allow role pings in the content. Webhooks can ping a
-        # role via this even if that role's own "Allow anyone to @mention
-        # this role" setting is off.
-        "allowed_mentions": {"parse": ["roles"]},
-    }
+    payload = {"content": content, "embeds": [embed]}
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -464,7 +433,7 @@ def main() -> int:
             get_name=lambda item: item["evolution"]["name"],
             embed_fn=evolution_embed,
             webhook_url=EVOLUTIONS_WEBHOOK_URL,
-            announce_text=f"{role_mention(EVOLUTIONS_ROLE_ID)}New evolution(s) added! \U0001F6A8",
+            announce_text="New evolution(s) added! \U0001F6A8",
             seen_ids=set(state["evolutions_seen"]),
         )
     )
@@ -477,7 +446,7 @@ def main() -> int:
             get_name=lambda item: item["name"],
             embed_fn=sbc_embed,
             webhook_url=SBC_WEBHOOK_URL,
-            announce_text=f"{role_mention(SBC_ROLE_ID)}New SBC(s) added! \U0001F6A8",
+            announce_text="New SBC(s) added! \U0001F6A8",
             seen_ids=set(state["sbcs_seen"]),
         )
     )
@@ -490,7 +459,7 @@ def main() -> int:
             get_name=lambda item: item["name"],
             embed_fn=objective_embed,
             webhook_url=OBJECTIVES_WEBHOOK_URL,
-            announce_text=f"{role_mention(OBJECTIVES_ROLE_ID)}New objective(s) added! \U0001F6A8",
+            announce_text="New objective(s) added! \U0001F6A8",
             seen_ids=set(state["objectives_seen"]),
         )
     )
