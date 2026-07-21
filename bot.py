@@ -9,9 +9,12 @@ too.
 How it gets data:
   fut.gg is a client-rendered app (TanStack Start) that embeds its page data
   in a global `window.__TSR_ROUTER__` object once loaded. There's no public
-  JSON API, so this script uses Playwright (headless Chromium) to load each
-  page for real and pull the data out of that object directly -- the exact
-  same data structure the site itself renders from.
+  JSON API for most pages, so this script uses Playwright (headless
+  Chromium) to load each page for real and pull the data out of that object
+  directly -- the exact same data structure the site itself renders from.
+  SBCs are the one exception: fut.gg moved that page to a paginated
+  client-side API (see SBC_API below), so we call that endpoint directly
+  instead.
 
 State:
   Previously-seen ids for each category are stored in state/state.json. On
@@ -30,21 +33,10 @@ Role pings:
   role at the start of the announcement message (e.g. so your "New SBC"
   reaction-role members get notified). Leave any of them unset to post
   without a ping for that category.
-
-Trending / best evolved players:
-  fut.gg's /evolutions/best/ page lists the highest meta-rated PLAYER cards
-  you can currently build through Evolutions (e.g. "Doumbia -- 97.1 meta
-  rating"), ranked best-first. For each of the top players in that list, we
-  look up their best evolution path (fut.gg's paths API, which returns every
-  possible chain for a base card ranked best-first) to get the exact meta
-  rating, the evolution chain used to reach it, and card art. Anything newly
-  in that top ranking gets posted to a separate "trending" webhook, best
-  meta rating first.
 """
 
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -57,23 +49,18 @@ FUTGG_BASE = "https://www.fut.gg"
 EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/"
 SBC_URL = f"{FUTGG_BASE}/sbc/"
 OBJECTIVES_URL = f"{FUTGG_BASE}/objectives/"
-BEST_EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/best/"
-# Every possible evolution-chain ("path") for a given base card, ranked
-# best-meta-rating-first by fut.gg. {base_ea_id} is the root/un-evolved
-# card's EA id.
-PATHS_API = f"{FUTGG_BASE}/api/fut/evolutions/v2/26/paths/v2/{{base_ea_id}}/"
-# How many of the top-ranked "best evolution players" to track/post per run.
-TRENDING_TOP_N = 20
-# Never post a trending player below this GG (meta) rating, even if they'd
-# otherwise fall within the top N.
-MIN_TRENDING_GG_RATING = 93.0
+# fut.gg's SBC list page used to embed every SBC in the page's initial
+# loaderData (loaderData.allSbcs). fut.gg restructured that page at some
+# point to only load category summaries up front and fetch the actual SBC
+# sets client-side (via React Query) from this paginated endpoint instead.
+# {page} is 1-indexed; the response has {data: [...], next, totalPages}.
+SBC_API = f"{FUTGG_BASE}/api/fut/sbc/"
 
 STATE_PATH = Path(__file__).parent / "state" / "state.json"
 
 EVOLUTIONS_WEBHOOK_URL = os.environ.get("EVOLUTIONS_WEBHOOK_URL", "")
 SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
 OBJECTIVES_WEBHOOK_URL = os.environ.get("OBJECTIVES_WEBHOOK_URL", "")
-TRENDING_EVOLUTIONS_WEBHOOK_URL = os.environ.get("TRENDING_EVOLUTIONS_WEBHOOK_URL", "")
 
 # Optional: Discord role IDs to @-mention when posting. If left blank, the
 # post still goes out, just without a role ping. These correspond to the
@@ -81,12 +68,10 @@ TRENDING_EVOLUTIONS_WEBHOOK_URL = os.environ.get("TRENDING_EVOLUTIONS_WEBHOOK_UR
 EVOLUTIONS_ROLE_ID = os.environ.get("EVOLUTIONS_ROLE_ID", "")
 SBC_ROLE_ID = os.environ.get("SBC_ROLE_ID", "")
 OBJECTIVES_ROLE_ID = os.environ.get("OBJECTIVES_ROLE_ID", "")
-TRENDING_EVOLUTIONS_ROLE_ID = os.environ.get("TRENDING_EVOLUTIONS_ROLE_ID", "")
 
 EMBED_COLOR_EVOLUTION = 0x5865F2  # discord blurple
 EMBED_COLOR_SBC = 0x57F287  # green
 EMBED_COLOR_OBJECTIVE = 0xFEE75C  # yellow
-EMBED_COLOR_TRENDING = 0xFF6600  # orange
 
 # Discord webhooks are rate-limited (~5 requests per 2 seconds). Posting a
 # batch of new items back-to-back with no pause can trip that limit and
@@ -97,12 +82,6 @@ DEFAULT_STATE = {
     "evolutions_seen": [],
     "sbcs_seen": [],
     "objectives_seen": [],
-    # Base player ids currently in fut.gg's "best evolution players" top
-    # ranking as of the last run. This is a snapshot, not an ever-growing
-    # set -- a player that rotates out of the ranking and later comes back
-    # in will get posted again, since it's a genuinely new appearance on
-    # the leaderboard.
-    "trending_evolutions_seen": [],
 }
 
 
@@ -149,18 +128,53 @@ def fetch_evolutions(page) -> list[dict]:
 
 
 def fetch_sbcs(page) -> list[dict]:
+    """fut.gg's SBC list page no longer embeds all SBCs in its initial
+    loaderData (that used to live at loaderData.allSbcs) -- it now only
+    loads category summaries up front and fetches the actual SBC sets
+    client-side, paginated, from SBC_API. So we load the page (mainly to
+    get a same-origin context to fetch from) and then page through that
+    API directly, same as fut.gg's own frontend does."""
     page.goto(SBC_URL, wait_until="networkidle")
-    data = page.evaluate(
+    result = page.evaluate(
         """
-        () => {
-            const m = window.__TSR_ROUTER__.state.matches.find(
-                m => m.id === '/sbc/_sbcListLayout'
-            );
-            return m ? m.loaderData.allSbcs : [];
+        async (apiUrl) => {
+            const all = [];
+            const debug = [];
+            let pageNum = 1;
+            for (let i = 0; i < 20; i++) {
+                let r;
+                try {
+                    r = await fetch(`${apiUrl}?page=${pageNum}`, {
+                        headers: { Accept: 'application/json' },
+                    });
+                } catch (e) {
+                    debug.push(`page ${pageNum}: network error ${String(e)}`);
+                    break;
+                }
+                if (!r.ok) {
+                    let bodySnippet = '';
+                    try { bodySnippet = (await r.text()).slice(0, 200); } catch (e) {}
+                    debug.push(`page ${pageNum}: HTTP ${r.status} ${bodySnippet}`);
+                    break;
+                }
+                const json = await r.json();
+                debug.push(`page ${pageNum}: got ${(json.data || []).length} item(s), next=${json.next}`);
+                all.push(...(json.data || []));
+                if (!json.next) break;
+                pageNum = json.next;
+            }
+            return { items: all, debug };
         }
-        """
+        """,
+        SBC_API,
     )
-    return data or []
+    items = (result or {}).get("items") or []
+    debug_lines = (result or {}).get("debug") or []
+    if not items:
+        print("  ! SBC API returned no items -- diagnostic trace:")
+        for line in debug_lines:
+            print(f"    {line}")
+    return items
 
 
 def fetch_objectives(page) -> list[dict]:
@@ -176,72 +190,6 @@ def fetch_objectives(page) -> list[dict]:
         """
     )
     return data or []
-
-
-def path_card_image_url(step: dict) -> str | None:
-    p = step.get("futggCardImagePath") or step.get("cardImagePath")
-    if not p:
-        return None
-    return f"https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=300/{p}"
-
-
-def fetch_best_evolution_players(page, limit: int = TRENDING_TOP_N) -> list[dict]:
-    """fut.gg's /evolutions/best/ page ranks the highest meta-rated PLAYER
-    cards buildable through Evolutions right now, best first. The page only
-    gives us name + a link to that player's evolutions page in its embedded
-    data, so for each of the top `limit` players we pull their EA id out of
-    that link and look up their single best evolution path (fut.gg ranks a
-    player's paths best-meta-rating-first) to get the exact rating, the
-    evolution chain used, and card art."""
-    page.goto(BEST_EVOLUTIONS_URL, wait_until="networkidle")
-    player_items = page.evaluate(
-        """
-        () => {
-            const m = window.__TSR_ROUTER__.state.matches.find(
-                m => m.id === '/evolutions/best'
-            );
-            return m ? m.loaderData.playerItems : [];
-        }
-        """
-    ) or []
-
-    results = []
-    for item in player_items[:limit]:
-        match = re.match(r"/players/(\d+)-", item.get("url") or "")
-        if not match:
-            continue
-        base_ea_id = int(match.group(1))
-
-        paths_result = page.evaluate(
-            """
-            async (url) => {
-                const r = await fetch(url);
-                if (!r.ok) return null;
-                return r.json();
-            }
-            """,
-            PATHS_API.format(base_ea_id=base_ea_id),
-        )
-        if not paths_result or not paths_result.get("data"):
-            continue
-
-        best_path = paths_result["data"][0]
-        final_step = best_path["path"][-1]
-        gg_rating = final_step.get("ggRating")
-        if gg_rating is not None and gg_rating < MIN_TRENDING_GG_RATING:
-            continue
-        results.append(
-            {
-                "id": base_ea_id,
-                "name": item.get("name") or player_name(final_step),
-                "ggRating": gg_rating,
-                "overall": final_step.get("overall"),
-                "evoNames": [e["name"] for e in (best_path.get("evolutions") or [])],
-                "cardImageUrl": path_card_image_url(final_step),
-                "url": f"{FUTGG_BASE}{item['url']}" if item.get("url") else None,
-            }
-        )
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -346,38 +294,15 @@ def evolution_embed(item: dict) -> dict:
     return embed
 
 
-def trending_player_embed(entry: dict, rank: int) -> dict:
-    """`entry` is one item built by fetch_best_evolution_players() -- a real
-    evolved player card, its meta rating, and the evolution chain used to
-    reach it."""
-    gg = entry.get("ggRating")
-    gg_text = f"{gg:.1f}" if isinstance(gg, (int, float)) else "Unknown"
-    chain = " → ".join(entry.get("evoNames") or [])
-
-    embed = {
-        "title": f"{entry.get('name', 'Unknown')} — {entry.get('overall', '?')} OVR"[:256],
-        "description": f"Ranked **#{rank}** highest meta-rated evolution player right now.",
-        "color": EMBED_COLOR_TRENDING,
-        "fields": [
-            {"name": "Meta Rating", "value": gg_text, "inline": True},
-            {"name": "Final Rating", "value": str(entry.get("overall", "?")), "inline": True},
-            {"name": "Evolutions Used", "value": str(len(entry.get("evoNames") or [])), "inline": True},
-            {"name": "Evolution Path", "value": chain or "Unknown", "inline": False},
-        ],
-    }
-    if entry.get("url"):
-        embed["url"] = entry["url"]
-    if entry.get("cardImageUrl"):
-        embed["image"] = {"url": entry["cardImageUrl"]}
-    return embed
-
-
 def sbc_image_url(sbc: dict) -> str | None:
-    """SBCs sometimes have their own image, otherwise fall back to the
-    first reward's player card image (fut.gg does the same on its own
-    SBC listing)."""
+    """SBC sets have their own artwork at `imagePath` (a relative path, same
+    CDN pattern as player card images) -- fall back to the first reward's
+    player card image if that's ever missing, same as fut.gg's own SBC
+    listing does."""
     if sbc.get("imageUrl"):
         return sbc["imageUrl"]
+    if sbc.get("imagePath"):
+        return f"https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=400/{sbc['imagePath']}"
     awards = sbc.get("awards") or []
     if awards and awards[0].get("player") and awards[0]["player"].get("cardImageUrl"):
         return awards[0]["player"]["cardImageUrl"]
@@ -466,17 +391,31 @@ def objective_embed(obj: dict) -> dict:
 # Discord posting
 # ---------------------------------------------------------------------------
 
-def post_webhook(webhook_url: str, content: str, embed: dict, max_retries: int = 3) -> bool:
-    """Post one message to a Discord webhook. Returns True on success, False
-    on failure (after retries) -- never raises, so one bad item can't kill
-    the rest of the run."""
+def post_webhook(
+    webhook_url: str,
+    content: str,
+    embeds: dict | list[dict],
+    max_retries: int = 3,
+    file_bytes: bytes | None = None,
+    file_name: str | None = None,
+) -> bool:
+    """Post one message to a Discord webhook. `embeds` can be a single embed
+    dict (most categories) or a list of embed dicts. If `file_bytes` is
+    given (e.g. a rendered card PNG), it's uploaded alongside the embed as a
+    multipart attachment -- the embed should reference it via
+    `attachment://{file_name}` as its image url. Returns True on success,
+    False on failure (after retries) -- never raises, so one bad item can't
+    kill the rest of the run."""
     if not webhook_url:
         print("  (no webhook URL configured, skipping post)")
         return False
 
+    if isinstance(embeds, dict):
+        embeds = [embeds]
+
     payload = {
         "content": content,
-        "embeds": [embed],
+        "embeds": embeds[:10],  # Discord allows at most 10 embeds per message
         # Explicitly allow role pings in the content. Webhooks can ping a
         # role via this even if that role's own "Allow anyone to @mention
         # this role" setting is off.
@@ -485,7 +424,15 @@ def post_webhook(webhook_url: str, content: str, embed: dict, max_retries: int =
 
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(webhook_url, json=payload, timeout=30)
+            if file_bytes and file_name:
+                resp = requests.post(
+                    webhook_url,
+                    data={"payload_json": json.dumps(payload)},
+                    files={"files[0]": (file_name, file_bytes, "image/png")},
+                    timeout=30,
+                )
+            else:
+                resp = requests.post(webhook_url, json=payload, timeout=30)
         except requests.RequestException as e:
             print(f"  ! network error posting to Discord: {e}")
             return False
@@ -576,35 +523,7 @@ def main() -> int:
         objectives = fetch_objectives(page)
         print(f"  found {len(objectives)} live objectives")
 
-        print("Fetching best/trending evolved players from fut.gg...")
-        best_players = fetch_best_evolution_players(page)
-        print(f"  found {len(best_players)} ranked entries")
-
         browser.close()
-
-    # Trending / best evolved players leaderboard -- post whatever just
-    # entered the top ranking since last run, best meta rating first,
-    # picture + evolution path chain included. Unlike the other categories,
-    # this one posts on the very first run too -- the list is capped at a
-    # small top N, not hundreds of items, so there's no backfill-spam risk.
-    trending_seen_before = set(state.get("trending_evolutions_seen", []))
-    new_entries = [
-        (rank, entry) for rank, entry in enumerate(best_players, start=1) if entry["id"] not in trending_seen_before
-    ]
-    if new_entries:
-        print(f"Posting {len(new_entries)} newly-ranked trending player(s)...")
-    else:
-        print("No newly-ranked trending players this run (top ranking unchanged since last run).")
-    for i, (rank, entry) in enumerate(new_entries):
-        print(f"Posting trending player: {entry.get('name')} (rank {rank}, {entry.get('ggRating')} meta rating)")
-        post_webhook(
-            TRENDING_EVOLUTIONS_WEBHOOK_URL,
-            f"{role_mention(TRENDING_EVOLUTIONS_ROLE_ID)}\U0001F525 New top evolved player -- {entry.get('ggRating', '?')} meta rating!",
-            trending_player_embed(entry, rank),
-        )
-        if i < len(new_entries) - 1:
-            time.sleep(POST_DELAY_SECONDS)
-    state["trending_evolutions_seen"] = [e["id"] for e in best_players]
 
     state["evolutions_seen"] = sorted(
         process_category(
