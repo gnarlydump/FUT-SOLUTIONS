@@ -96,19 +96,6 @@ roles, the bot can @-mention that role in the announcement message.
    `allowed_mentions` explicitly, so the ping works even if the role's own
    "Allow anyone to @mention this role" setting is off.
 
-### 6. (Optional) Trending evolved players channel
-
-fut.gg ranks the highest meta-rated player cards you can currently build
-through Evolutions (its "Best Evolution Players" list). If you set up a
-`TRENDING_EVOLUTIONS_WEBHOOK_URL` secret, the bot posts whatever newly
-enters that top-10 ranking each run -- highest meta rating first, with a
-picture, the meta rating, and the exact evolution chain (path) used to
-reach it.
-
-1. Create a Discord webhook for this channel the same way as step 1.
-2. Add it as a repo secret named `TRENDING_EVOLUTIONS_WEBHOOK_URL`.
-3. Optionally add `TRENDING_EVOLUTIONS_ROLE_ID` the same way as the other role IDs in step 5, if you want a role pinged for this channel too.
-
 ## Customizing
 
 - **Frequency:** edit the `cron` line in `.github/workflows/check.yml`
