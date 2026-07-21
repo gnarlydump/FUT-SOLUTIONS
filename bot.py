@@ -296,16 +296,22 @@ def evolution_embed(item: dict) -> dict:
 
 def sbc_image_url(sbc: dict) -> str | None:
     """SBC sets have their own artwork at `imagePath` (a relative path, same
-    CDN pattern as player card images) -- fall back to the first reward's
-    player card image if that's ever missing, same as fut.gg's own SBC
-    listing does."""
+    CDN pattern as player card images), but when the reward is actually a
+    specific player item, show that player's real card instead -- fut.gg's
+    own `imagePath` is sometimes just a generic promo shield (e.g. for
+    tournament-reward SBCs), while the reward's card is always the actual
+    player being earned."""
+    for award in sbc.get("awards") or []:
+        player = award.get("player")
+        if not player:
+            continue
+        card_path = player.get("cardImagePath") or player.get("simpleCardImagePath")
+        if card_path:
+            return f"https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=300/{card_path}"
     if sbc.get("imageUrl"):
         return sbc["imageUrl"]
     if sbc.get("imagePath"):
         return f"https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=400/{sbc['imagePath']}"
-    awards = sbc.get("awards") or []
-    if awards and awards[0].get("player") and awards[0]["player"].get("cardImageUrl"):
-        return awards[0]["player"]["cardImageUrl"]
     return None
 
 
