@@ -584,25 +584,26 @@ def main() -> int:
 
     # Trending / best evolved players leaderboard -- post whatever just
     # entered the top ranking since last run, best meta rating first,
-    # picture + evolution path chain included.
+    # picture + evolution path chain included. Unlike the other categories,
+    # this one posts on the very first run too -- the list is capped at a
+    # small top N, not hundreds of items, so there's no backfill-spam risk.
     trending_seen_before = set(state.get("trending_evolutions_seen", []))
-    if not trending_seen_before:
-        print(f"First run for trending evolved players: seeding top {len(best_players)} without posting.")
+    new_entries = [
+        (rank, entry) for rank, entry in enumerate(best_players, start=1) if entry["id"] not in trending_seen_before
+    ]
+    if new_entries:
+        print(f"Posting {len(new_entries)} newly-ranked trending player(s)...")
     else:
-        new_entries = [
-            (rank, entry) for rank, entry in enumerate(best_players, start=1) if entry["id"] not in trending_seen_before
-        ]
-        if new_entries:
-            print(f"Posting {len(new_entries)} newly-ranked trending player(s)...")
-        for i, (rank, entry) in enumerate(new_entries):
-            print(f"Posting trending player: {entry.get('name')} (rank {rank}, {entry.get('ggRating')} meta rating)")
-            post_webhook(
-                TRENDING_EVOLUTIONS_WEBHOOK_URL,
-                f"{role_mention(TRENDING_EVOLUTIONS_ROLE_ID)}\U0001F525 New top evolved player -- {entry.get('ggRating', '?')} meta rating!",
-                trending_player_embed(entry, rank),
-            )
-            if i < len(new_entries) - 1:
-                time.sleep(POST_DELAY_SECONDS)
+        print("No newly-ranked trending players this run (top ranking unchanged since last run).")
+    for i, (rank, entry) in enumerate(new_entries):
+        print(f"Posting trending player: {entry.get('name')} (rank {rank}, {entry.get('ggRating')} meta rating)")
+        post_webhook(
+            TRENDING_EVOLUTIONS_WEBHOOK_URL,
+            f"{role_mention(TRENDING_EVOLUTIONS_ROLE_ID)}\U0001F525 New top evolved player -- {entry.get('ggRating', '?')} meta rating!",
+            trending_player_embed(entry, rank),
+        )
+        if i < len(new_entries) - 1:
+            time.sleep(POST_DELAY_SECONDS)
     state["trending_evolutions_seen"] = [e["id"] for e in best_players]
 
     state["evolutions_seen"] = sorted(
