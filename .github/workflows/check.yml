@@ -5,6 +5,11 @@ on:
     # Runs at the top of every hour (GitHub may delay this by a few minutes
     # during busy periods -- that's normal for scheduled Actions).
     - cron: "0 * * * *"
+    # Dedicated daily run right after fut.gg's known daily content drop
+    # (17:00 UTC = 10:00 AM Arizona/MST, which doesn't observe DST). This
+    # exists on top of the hourly run above so there's always a check
+    # landing close to the drop even if the hourly one gets delayed.
+    - cron: "1 17 * * *"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
 permissions:
