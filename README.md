@@ -1,8 +1,16 @@
 # fut.gg → Discord notifier
 
-Posts a message to Discord whenever fut.gg lists a new **Evolution** or a new
-**SBC**, each to its own channel. Runs automatically once an hour via GitHub
+Posts a message to Discord whenever fut.gg lists a new **Evolution**, **SBC**,
+or **Objective**, each to its own channel. Runs automatically via GitHub
 Actions — no server or always-on computer required.
+
+**Schedule:** checks run every hour around the clock, plus extra checks at
+10:01, 10:05, 10:10, and 10:15 AM MST (Arizona time, no DST) right after
+fut.gg's daily content drop at 10:00 AM MST -- see `.github/workflows/check.yml`.
+The extra checks exist because GitHub's scheduled triggers aren't perfectly
+precise and can run a few minutes late; having several chances shortly after
+10:00 means new content gets caught quickly instead of potentially waiting
+up to an hour for the next hourly check.
 
 **Cost: $0, permanently — as long as the repo is public.** GitHub Actions
 gives public repos unlimited free minutes. Private repos only get 2,000 free
@@ -75,7 +83,7 @@ For each channel:
    from `state/state.json` in the repo and re-run; those items will get
    re-posted as if new.
 
-After that, it runs automatically every hour on its own.
+After that, it runs automatically on its own -- see the Schedule note above.
 
 ### 5. (Optional) Ping a role when something new posts
 
@@ -98,8 +106,9 @@ roles, the bot can @-mention that role in the announcement message.
 
 ## Customizing
 
-- **Frequency:** edit the `cron` line in `.github/workflows/check.yml`
-  (currently `"0 * * * *"` = every hour). Cron is in UTC.
+- **Frequency:** edit the `cron` lines in `.github/workflows/check.yml`
+  (currently hourly, plus extra checks at 10:01/10:05/10:10/10:15 AM MST
+  after the daily content drop). Cron is always evaluated in UTC.
 - **Message format:** edit `evolution_embed()` / `sbc_embed()` in `bot.py`.
 - **One channel instead of two:** just use the same webhook URL for both
   `EVOLUTIONS_WEBHOOK_URL` and `SBC_WEBHOOK_URL` secrets.
