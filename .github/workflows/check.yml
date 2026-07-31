@@ -3,20 +3,20 @@ name: Check fut.gg for new evolutions and SBCs
 on:
   schedule:
     # Runs at the top of every hour (GitHub may delay this by a few minutes
-    # during busy periods -- that's normal for scheduled Actions).
+    # during busy periods -- that's normal for scheduled Actions). This also
+    # happens to line up exactly with fut.gg's daily content drop, since it
+    # fires at 17:00 UTC = 10:00 AM Arizona/MST (no DST there).
     - cron: "0 * * * *"
-    # Dense burst of checks around fut.gg's known daily content drop
-    # (17:00 UTC = 10:00 AM Arizona/MST, which doesn't observe DST).
-    # GitHub's scheduled triggers aren't precise -- they can fire several
-    # minutes early or late -- so instead of relying on one exact-minute
-    # trigger, this runs every few minutes through the window (9:55-10:10
-    # MST) to make sure something lands close to the actual drop no matter
-    # which way GitHub's timing drifts that day.
-    - cron: "55 16 * * *"  # 9:55 AM MST
-    - cron: "58 16 * * *"  # 9:58 AM MST
+    # Follow-up checks after the daily drop (10:01 / 10:05 / 10:10 / 10:15
+    # AM MST). None of these fire before 10:00 -- they exist because
+    # GitHub's scheduled triggers aren't precise and can run late, so this
+    # gives several chances to catch the new content shortly after it
+    # actually goes live instead of waiting up to an hour for the next
+    # hourly check.
     - cron: "1 17 * * *"   # 10:01 AM MST
     - cron: "5 17 * * *"   # 10:05 AM MST
     - cron: "10 17 * * *"  # 10:10 AM MST
+    - cron: "15 17 * * *"  # 10:15 AM MST
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
 permissions:
