@@ -2,22 +2,31 @@ name: Check fut.gg for new evolutions and SBCs
 
 on:
   schedule:
-    # Runs at the top of every hour (GitHub may delay this by a few minutes
-    # during busy periods -- that's normal for scheduled Actions). This also
-    # happens to line up exactly with fut.gg's daily content drop, since it
-    # fires at 17:00 UTC = 10:00 AM Arizona/MST (no DST there).
+    # Runs at the top of every hour, all day, as a general safety net
+    # (GitHub may delay this by a few minutes during busy periods -- that's
+    # normal for scheduled Actions). The precise 10:00/10:05 AM MST daily
+    # checks are handled externally by cron-job.org calling the
+    # workflow_dispatch API below, NOT by additional cron lines here --
+    # GitHub's own scheduled triggers proved unreliable for that (delayed
+    # by up to an hour, and newly-added cron lines sometimes never fired at
+    # all). Keeping only the hourly entry here also avoids this schedule
+    # colliding with the external 17:00/17:05 UTC triggers and launching
+    # two overlapping runs at once (see `concurrency` below for the actual
+    # duplicate-post protection either way).
     - cron: "0 * * * *"
-    # Follow-up checks after the daily drop (10:01 / 10:05 / 10:10 / 10:15
-    # AM MST). None of these fire before 10:00 -- they exist because
-    # GitHub's scheduled triggers aren't precise and can run late, so this
-    # gives several chances to catch the new content shortly after it
-    # actually goes live instead of waiting up to an hour for the next
-    # hourly check.
-    - cron: "1 17 * * *"   # 10:01 AM MST
-    - cron: "5 17 * * *"   # 10:05 AM MST
-    - cron: "10 17 * * *"  # 10:10 AM MST
-    - cron: "15 17 * * *"  # 10:15 AM MST
-  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+  workflow_dispatch: {}  # lets you trigger it manually (by hand, or via cron-job.org's API call)
+
+# If a run is somehow still in progress when the next trigger fires
+# (e.g. the hourly schedule and an external cron-job.org trigger landing
+# close together), queue the new run instead of starting it in parallel.
+# Two runs executing at once would both read the same "seen" state before
+# either had a chance to save it, and both would post the same "new" items
+# -- this is what caused duplicate Discord posts. Queuing (not canceling)
+# means the second run always starts from the first run's already-updated
+# state, so it correctly sees those items as no longer new.
+concurrency:
+  group: futgg-bot-check
+  cancel-in-progress: false
 
 permissions:
   contents: write  # needed so the workflow can commit the updated state file
