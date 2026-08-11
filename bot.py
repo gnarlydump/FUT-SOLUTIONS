@@ -112,8 +112,27 @@ def save_state(state: dict) -> None:
 # Scraping (via headless browser -- see module docstring for why)
 # ---------------------------------------------------------------------------
 
+def goto_and_wait_for_router(page, url: str) -> None:
+    """Navigate to a fut.gg page and wait until its client-side router state
+    is actually populated -- NOT until the network goes fully idle.
+
+    fut.gg pages carry ad-network/analytics scripts (AdThrive etc.) that keep
+    making background requests indefinitely, so `wait_until="networkidle"`
+    can hang for the full 30s timeout and kill the whole run even though the
+    page data we actually need (window.__TSR_ROUTER__) was ready in a couple
+    seconds. Waiting for "domcontentloaded" plus an explicit poll for the
+    router object is faster and far less likely to time out."""
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_function(
+        "() => window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state && "
+        "window.__TSR_ROUTER__.state.matches && "
+        "window.__TSR_ROUTER__.state.matches.length > 0",
+        timeout=20000,
+    )
+
+
 def fetch_evolutions(page) -> list[dict]:
-    page.goto(EVOLUTIONS_URL, wait_until="networkidle")
+    goto_and_wait_for_router(page, EVOLUTIONS_URL)
     data = page.evaluate(
         """
         () => {
@@ -134,7 +153,7 @@ def fetch_sbcs(page) -> list[dict]:
     client-side, paginated, from SBC_API. So we load the page (mainly to
     get a same-origin context to fetch from) and then page through that
     API directly, same as fut.gg's own frontend does."""
-    page.goto(SBC_URL, wait_until="networkidle")
+    goto_and_wait_for_router(page, SBC_URL)
     result = page.evaluate(
         """
         async (apiUrl) => {
@@ -178,7 +197,7 @@ def fetch_sbcs(page) -> list[dict]:
 
 
 def fetch_objectives(page) -> list[dict]:
-    page.goto(OBJECTIVES_URL, wait_until="networkidle")
+    goto_and_wait_for_router(page, OBJECTIVES_URL)
     data = page.evaluate(
         """
         () => {
@@ -513,21 +532,44 @@ def process_category(
 def main() -> int:
     state = load_state()
 
+    # Each category is fetched independently and wrapped in its own
+    # try/except -- fut.gg's pages occasionally time out (ad/analytics
+    # scripts keep the network "busy" indefinitely) or the site changes
+    # shape under us. Previously a failure fetching ANY one category (most
+    # often evolutions, since it's fetched first) raised an unhandled
+    # exception that killed the whole run before SBCs or objectives were
+    # even attempted -- so a single flaky page load meant NOTHING posted
+    # that run. Now a failure here just means that one category is skipped
+    # for this run (nothing is falsely marked as "removed" -- see
+    # process_category) and the others still get checked and posted.
+    evolutions: list[dict] = []
+    sbcs: list[dict] = []
+    objectives: list[dict] = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
 
         print("Fetching evolutions from fut.gg...")
-        evolutions = fetch_evolutions(page)
-        print(f"  found {len(evolutions)} live evolutions")
+        try:
+            evolutions = fetch_evolutions(page)
+            print(f"  found {len(evolutions)} live evolutions")
+        except Exception as e:
+            print(f"  ! failed to fetch evolutions, skipping this category this run: {e}")
 
         print("Fetching SBCs from fut.gg...")
-        sbcs = fetch_sbcs(page)
-        print(f"  found {len(sbcs)} live SBCs")
+        try:
+            sbcs = fetch_sbcs(page)
+            print(f"  found {len(sbcs)} live SBCs")
+        except Exception as e:
+            print(f"  ! failed to fetch SBCs, skipping this category this run: {e}")
 
         print("Fetching objectives from fut.gg...")
-        objectives = fetch_objectives(page)
-        print(f"  found {len(objectives)} live objectives")
+        try:
+            objectives = fetch_objectives(page)
+            print(f"  found {len(objectives)} live objectives")
+        except Exception as e:
+            print(f"  ! failed to fetch objectives, skipping this category this run: {e}")
 
         browser.close()
 
