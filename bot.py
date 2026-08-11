@@ -112,32 +112,51 @@ def save_state(state: dict) -> None:
 # Scraping (via headless browser -- see module docstring for why)
 # ---------------------------------------------------------------------------
 
-def goto_and_wait_for_router(page, url: str) -> None:
-    """Navigate to a fut.gg page and wait until its client-side router state
-    is actually populated -- NOT until the network goes fully idle.
+def goto_and_wait_for_router(page, url: str, ready_check_js: str) -> None:
+    """Navigate to a fut.gg page and wait until the SPECIFIC piece of router
+    state we're about to read is actually populated -- NOT until the network
+    goes fully idle, and NOT just until *some* router match exists.
 
     fut.gg pages carry ad-network/analytics scripts (AdThrive etc.) that keep
     making background requests indefinitely, so `wait_until="networkidle"`
     can hang for the full 30s timeout and kill the whole run even though the
     page data we actually need (window.__TSR_ROUTER__) was ready in a couple
-    seconds. Waiting for "domcontentloaded" plus an explicit poll for the
-    router object is faster and far less likely to time out."""
+    seconds. But waiting only for "any router match to exist" is too loose --
+    TanStack Start resolves matches in stages, so an early, incomplete match
+    can appear before the one carrying our actual data (loaderData.evolutions
+    etc.), and evaluating too early silently returns an empty list instead of
+    erroring. `ready_check_js` is a JS boolean expression checking for the
+    exact data each caller is about to read, so we only proceed once it's
+    genuinely there.
+    """
     page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_function(
-        "() => window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state && "
-        "window.__TSR_ROUTER__.state.matches && "
-        "window.__TSR_ROUTER__.state.matches.length > 0",
-        timeout=20000,
-    )
+    page.wait_for_function(ready_check_js, timeout=20000)
 
 
 def fetch_evolutions(page) -> list[dict]:
-    goto_and_wait_for_router(page, EVOLUTIONS_URL)
+    # Match by the SHAPE of loaderData (which match has an
+    # `evolutions.data` array), not by the route's id string. fut.gg has
+    # changed that id string more than once (e.g. '/evolutions/' became
+    # '/evolutions//evolutions/' after a router upgrade) with no notice --
+    # matching by id broke silently (empty result, no error) each time.
+    # Matching by data shape survives those renames.
+    goto_and_wait_for_router(
+        page,
+        EVOLUTIONS_URL,
+        """
+        () => {
+            const matches = window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state.matches;
+            return !!(matches && matches.some(
+                m => m.loaderData && m.loaderData.evolutions && m.loaderData.evolutions.data
+            ));
+        }
+        """,
+    )
     data = page.evaluate(
         """
         () => {
             const m = window.__TSR_ROUTER__.state.matches.find(
-                m => m.id === '/evolutions/'
+                m => m.loaderData && m.loaderData.evolutions && m.loaderData.evolutions.data
             );
             return m ? m.loaderData.evolutions.data : [];
         }
@@ -153,7 +172,11 @@ def fetch_sbcs(page) -> list[dict]:
     client-side, paginated, from SBC_API. So we load the page (mainly to
     get a same-origin context to fetch from) and then page through that
     API directly, same as fut.gg's own frontend does."""
-    goto_and_wait_for_router(page, SBC_URL)
+    goto_and_wait_for_router(
+        page,
+        SBC_URL,
+        "() => window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state.matches.length > 0",
+    )
     result = page.evaluate(
         """
         async (apiUrl) => {
@@ -197,12 +220,25 @@ def fetch_sbcs(page) -> list[dict]:
 
 
 def fetch_objectives(page) -> list[dict]:
-    goto_and_wait_for_router(page, OBJECTIVES_URL)
+    # Same reasoning as fetch_evolutions() -- match by data shape
+    # (loaderData.allObjectives), not the route id string, which fut.gg has
+    # also renamed (e.g. gained a trailing '/objectives' segment) without
+    # notice.
+    goto_and_wait_for_router(
+        page,
+        OBJECTIVES_URL,
+        """
+        () => {
+            const matches = window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state.matches;
+            return !!(matches && matches.some(m => m.loaderData && m.loaderData.allObjectives));
+        }
+        """,
+    )
     data = page.evaluate(
         """
         () => {
             const m = window.__TSR_ROUTER__.state.matches.find(
-                m => m.id === '/objectives/_list/_withObjectives'
+                m => m.loaderData && m.loaderData.allObjectives
             );
             return m ? m.loaderData.allObjectives : [];
         }
