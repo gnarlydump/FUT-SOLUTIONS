@@ -321,10 +321,25 @@ def hours_until(iso_ts: str) -> float | None:
     return (dt - datetime.now(timezone.utc)).total_seconds() / 3600
 
 
+def format_expiry_timestamp(iso_ts: str) -> str | None:
+    """Discord renders <t:UNIX:F> / <t:UNIX:R> tags as a full date+time and
+    a live-updating relative countdown, automatically converted to each
+    viewer's own timezone -- more useful here than a hardcoded UTC string."""
+    if not iso_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    unix_ts = int(dt.timestamp())
+    return f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+
+
 def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
     """Reminder embed for an evolution approaching its submission deadline.
-    Deliberately lighter than evolution_embed() -- this is a nudge, not a
-    full re-announcement, so it skips requirements/upgrades detail."""
+    Carries the same detail as evolution_embed() (price, requirements,
+    upgrades) plus the urgency framing (time left, exact expiry
+    timestamp) that makes this reminder actually actionable."""
     evo = item["evolution"]
     base = item.get("basePlayer") or {}
     upgraded = item.get("upgradedPlayer") or {}
@@ -337,25 +352,57 @@ def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
     else:
         time_text = relative_days(evo.get("endSubmissionTime"))
 
+    price_bits = []
+    if evo.get("coinsCost"):
+        price_bits.append(f"{evo['coinsCost']:,} coins")
+    if evo.get("pointsCost"):
+        price_bits.append(f"{evo['pointsCost']:,} points")
+    if evo.get("tokenCost"):
+        price_bits.append(f"{evo['tokenCost']:,} tokens")
+    price_text = " + ".join(price_bits) if price_bits else "Free"
+
     name_line = ""
     if base and upgraded:
         name_line = (
             f"{player_name(base)}: {base.get('overall', '?')} -> "
-            f"{upgraded.get('overall', '?')} OVR"
+            f"{upgraded.get('overall', '?')} OVR\n\n"
         )
+    description = (name_line + (evo.get("description") or ""))[:4000]
+
+    fields = [
+        {"name": "Time Left", "value": time_text, "inline": True},
+        {"name": "Price", "value": price_text, "inline": True},
+    ]
+    expires_at = format_expiry_timestamp(evo.get("endSubmissionTime"))
+    if expires_at:
+        fields.append({"name": "Expires At", "value": expires_at, "inline": True})
+    fields.append(
+        {
+            "name": "Requirements",
+            "value": format_kv_lines(evo.get("requirementsText") or []),
+            "inline": False,
+        }
+    )
+    fields.append(
+        {
+            "name": "Upgrades",
+            "value": format_kv_lines(evo.get("totalUpgradesText") or []),
+            "inline": False,
+        }
+    )
 
     embed = {
-        "title": f"\u23F3 {(evo.get('name') or 'Evolution')[:240]} expires soon",
-        "description": name_line,
+        "title": f"\u23F3 {(evo.get('name') or 'Evolution')[:230]} expires soon",
+        "description": description,
         "color": EMBED_COLOR_EXPIRING,
-        "fields": [
-            {"name": "Time Left", "value": time_text, "inline": True},
-        ],
+        "fields": fields,
     }
     if evo.get("url"):
         embed["url"] = f"{FUTGG_BASE}{evo['url']}"
     if upgraded.get("cardImageUrl"):
-        embed["thumbnail"] = {"url": upgraded["cardImageUrl"]}
+        embed["image"] = {"url": upgraded["cardImageUrl"]}
+    if base.get("cardImageUrl"):
+        embed["thumbnail"] = {"url": base["cardImageUrl"]}
     return embed
 
 
