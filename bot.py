@@ -817,8 +817,12 @@ def main() -> int:
     # otherwise an empty `evolutions` list from a failed fetch would look
     # like every evolution disappeared and wipe their notified-state.
     if evolutions_fetch_ok:
+        expiry_notified = state.get("evolutions_expiry_notified", {})
+        if os.environ.get("FORCE_EXPIRY_REPOST", "").lower() == "true":
+            print("FORCE_EXPIRY_REPOST is set: clearing expiry-reminder history for this run.")
+            expiry_notified = {}
         state["evolutions_expiry_notified"] = check_expiring_evolutions(
-            evolutions, state.get("evolutions_expiry_notified", {})
+            evolutions, expiry_notified
         )
 
     save_state(state)
