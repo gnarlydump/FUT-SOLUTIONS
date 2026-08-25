@@ -438,7 +438,7 @@ def check_expiring_evolutions(
             )
             ok = post_webhook(
                 EXPIRING_EVOLUTIONS_WEBHOOK_URL,
-                f"{role_mention(EXPIRING_ROLE_ID)}Evolution expiring soon! \u23F0",
+                role_mention(EXPIRING_ROLE_ID).strip(),
                 expiring_evolution_embed(item, hours_left),
             )
             if ok:
