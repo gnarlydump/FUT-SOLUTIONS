@@ -321,36 +321,44 @@ def hours_until(iso_ts: str) -> float | None:
     return (dt - datetime.now(timezone.utc)).total_seconds() / 3600
 
 
-def format_expiry_timestamp(iso_ts: str) -> str | None:
-    """Discord renders <t:UNIX:F> / <t:UNIX:R> tags as a full date+time and
-    a live-updating relative countdown, automatically converted to each
-    viewer's own timezone -- more useful here than a hardcoded UTC string."""
+def hours_minutes_left(hours_left: float) -> str:
+    if hours_left < 0:
+        return "Expired"
+    total_minutes = round(hours_left * 60)
+    h, m = divmod(total_minutes, 60)
+    if h == 0:
+        return f"{m}m left"
+    return f"{h}h {m}m left"
+
+
+def format_expiry_est(iso_ts: str) -> str | None:
+    """Explicit Eastern-time date+time string (e.g. 'Aug 27, 2026, 3:24 PM
+    EDT') so everyone has one shared reference point regardless of their own
+    Discord timezone setting, rather than relying on Discord's per-viewer
+    auto-converting <t:...> tags. %Z resolves to EST or EDT automatically
+    depending on the date (daylight saving)."""
     if not iso_ts:
         return None
     try:
         dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
     except ValueError:
         return None
-    unix_ts = int(dt.timestamp())
-    return f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+    try:
+        from zoneinfo import ZoneInfo
+        eastern = dt.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        return None
+    return eastern.strftime("%b %d, %Y, %I:%M %p %Z").replace(" 0", " ")
 
 
 def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
-    """Reminder embed for an evolution approaching its submission deadline.
-    Carries the same detail as evolution_embed() (price, requirements,
-    upgrades) plus the urgency framing (time left, exact expiry
-    timestamp) that makes this reminder actually actionable."""
+    """Compact reminder embed for an evolution approaching its submission
+    deadline -- exact time left, explicit EST expiry timestamp, and just
+    enough detail (price, unlock requirements) to act on without opening
+    fut.gg."""
     evo = item["evolution"]
     base = item.get("basePlayer") or {}
     upgraded = item.get("upgradedPlayer") or {}
-
-    if hours_left < 1:
-        time_text = "Less than 1 hour left!"
-    elif hours_left < 48:
-        h = round(hours_left)
-        time_text = f"~{h} hour{'s' if h != 1 else ''} left"
-    else:
-        time_text = relative_days(evo.get("endSubmissionTime"))
 
     price_bits = []
     if evo.get("coinsCost"):
@@ -365,44 +373,36 @@ def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
     if base and upgraded:
         name_line = (
             f"{player_name(base)}: {base.get('overall', '?')} -> "
-            f"{upgraded.get('overall', '?')} OVR\n\n"
+            f"{upgraded.get('overall', '?')} OVR"
         )
-    description = (name_line + (evo.get("description") or ""))[:4000]
 
     fields = [
-        {"name": "Time Left", "value": time_text, "inline": True},
+        {"name": "Time Left", "value": hours_minutes_left(hours_left), "inline": True},
         {"name": "Price", "value": price_text, "inline": True},
     ]
-    expires_at = format_expiry_timestamp(evo.get("endSubmissionTime"))
-    if expires_at:
-        fields.append({"name": "Expires At", "value": expires_at, "inline": True})
+    expires_est = format_expiry_est(evo.get("endSubmissionTime"))
+    if expires_est:
+        fields.append({"name": "Expires (EST)", "value": expires_est, "inline": False})
     fields.append(
         {
-            "name": "Requirements",
-            "value": format_kv_lines(evo.get("requirementsText") or []),
-            "inline": False,
-        }
-    )
-    fields.append(
-        {
-            "name": "Upgrades",
-            "value": format_kv_lines(evo.get("totalUpgradesText") or []),
+            "name": "Requirements to Unlock",
+            "value": format_kv_lines(evo.get("requirementsText") or [], limit=20),
             "inline": False,
         }
     )
 
+    description = f"# {(evo.get('name') or 'Evolution')[:230]}"
+    if name_line:
+        description += f"\n{name_line}"
+
     embed = {
-        "title": f"\u23F3 {(evo.get('name') or 'Evolution')[:230]} expires soon",
+        "title": "\u23F3 EXPIRES SOON",
         "description": description,
         "color": EMBED_COLOR_EXPIRING,
         "fields": fields,
     }
     if evo.get("url"):
         embed["url"] = f"{FUTGG_BASE}{evo['url']}"
-    if upgraded.get("cardImageUrl"):
-        embed["image"] = {"url": upgraded["cardImageUrl"]}
-    if base.get("cardImageUrl"):
-        embed["thumbnail"] = {"url": base["cardImageUrl"]}
     return embed
 
 
