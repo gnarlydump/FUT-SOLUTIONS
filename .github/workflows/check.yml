@@ -14,7 +14,12 @@ on:
     # two overlapping runs at once (see `concurrency` below for the actual
     # duplicate-post protection either way).
     - cron: "0 * * * *"
-  workflow_dispatch: {}  # lets you trigger it manually (by hand, or via cron-job.org's API call)
+  workflow_dispatch:
+    inputs:
+      force_expiry_repost:
+        description: "Force a fresh repost of all currently-expiring evolutions (ignores what's already been notified)"
+        type: boolean
+        default: false
 
 # If a run is somehow still in progress when the next trigger fires
 # (e.g. the hourly schedule and an external cron-job.org trigger landing
@@ -58,6 +63,7 @@ jobs:
           SBC_ROLE_ID: ${{ secrets.SBC_ROLE_ID }}
           OBJECTIVES_ROLE_ID: ${{ secrets.OBJECTIVES_ROLE_ID }}
           EXPIRING_ROLE_ID: ${{ secrets.EXPIRING_ROLE_ID }}
+          FORCE_EXPIRY_REPOST: ${{ inputs.force_expiry_repost }}
         run: python bot.py
 
       - name: Commit updated state
