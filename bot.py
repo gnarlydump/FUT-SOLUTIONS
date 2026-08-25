@@ -61,17 +61,33 @@ STATE_PATH = Path(__file__).parent / "state" / "state.json"
 EVOLUTIONS_WEBHOOK_URL = os.environ.get("EVOLUTIONS_WEBHOOK_URL", "")
 SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
 OBJECTIVES_WEBHOOK_URL = os.environ.get("OBJECTIVES_WEBHOOK_URL", "")
+EXPIRING_EVOLUTIONS_WEBHOOK_URL = os.environ.get("EXPIRING_EVOLUTIONS_WEBHOOK_URL", "")
 
 # Optional: Discord role IDs to @-mention when posting. If left blank, the
 # post still goes out, just without a role ping. These correspond to the
-# "New Evolution" / "New SBC" / "New Objective" reaction roles.
+# "New Evolution" / "New SBC" / "New Objective" / "Evolution Expiring"
+# reaction roles.
 EVOLUTIONS_ROLE_ID = os.environ.get("EVOLUTIONS_ROLE_ID", "")
 SBC_ROLE_ID = os.environ.get("SBC_ROLE_ID", "")
 OBJECTIVES_ROLE_ID = os.environ.get("OBJECTIVES_ROLE_ID", "")
+EXPIRING_ROLE_ID = os.environ.get("EXPIRING_ROLE_ID", "")
 
 EMBED_COLOR_EVOLUTION = 0x5865F2  # discord blurple
 EMBED_COLOR_SBC = 0x57F287  # green
 EMBED_COLOR_OBJECTIVE = 0xFEE75C  # yellow
+EMBED_COLOR_EXPIRING = 0xED4245  # red -- urgency
+
+# Expiring-evolution reminder stages, ordered furthest-out first. Each is
+# (stage_name, hours_before_expiry). Every stage whose window has been
+# entered and hasn't already been posted (tracked per-evolution in
+# state["evolutions_expiry_notified"]) gets its own post -- so an evolution
+# discovered with 40 hours left gets only the 6h reminder later, while one
+# discovered with 60 hours left gets both the 48h warning and the 6h final
+# reminder as time passes.
+EXPIRY_REMINDER_STAGES = [
+    ("48h", 48),
+    ("final", 6),
+]
 
 # Discord webhooks are rate-limited (~5 requests per 2 seconds). Posting a
 # batch of new items back-to-back with no pause can trip that limit and
@@ -82,6 +98,10 @@ DEFAULT_STATE = {
     "evolutions_seen": [],
     "sbcs_seen": [],
     "objectives_seen": [],
+    # Maps evolution id (as a string, since JSON object keys must be
+    # strings) -> list of reminder stage names already posted for it, e.g.
+    # {"1234": ["48h"]}. Prevents re-posting the same reminder every hour.
+    "evolutions_expiry_notified": {},
 }
 
 
@@ -287,6 +307,102 @@ def relative_days(iso_ts: str) -> str:
     if days == 0:
         return "today"
     return f"in {days} day{'s' if days != 1 else ''}"
+
+
+def hours_until(iso_ts: str) -> float | None:
+    """Returns hours remaining until iso_ts (negative if already passed), or
+    None if iso_ts is missing/unparseable."""
+    if not iso_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+
+
+def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
+    """Reminder embed for an evolution approaching its submission deadline.
+    Deliberately lighter than evolution_embed() -- this is a nudge, not a
+    full re-announcement, so it skips requirements/upgrades detail."""
+    evo = item["evolution"]
+    base = item.get("basePlayer") or {}
+    upgraded = item.get("upgradedPlayer") or {}
+
+    if hours_left < 1:
+        time_text = "Less than 1 hour left!"
+    elif hours_left < 48:
+        h = round(hours_left)
+        time_text = f"~{h} hour{'s' if h != 1 else ''} left"
+    else:
+        time_text = relative_days(evo.get("endSubmissionTime"))
+
+    name_line = ""
+    if base and upgraded:
+        name_line = (
+            f"{player_name(base)}: {base.get('overall', '?')} -> "
+            f"{upgraded.get('overall', '?')} OVR"
+        )
+
+    embed = {
+        "title": f"\u23F3 {(evo.get('name') or 'Evolution')[:240]} expires soon",
+        "description": name_line,
+        "color": EMBED_COLOR_EXPIRING,
+        "fields": [
+            {"name": "Time Left", "value": time_text, "inline": True},
+        ],
+    }
+    if evo.get("url"):
+        embed["url"] = f"{FUTGG_BASE}{evo['url']}"
+    if upgraded.get("cardImageUrl"):
+        embed["thumbnail"] = {"url": upgraded["cardImageUrl"]}
+    return embed
+
+
+def check_expiring_evolutions(
+    evolutions: list[dict], notified: dict[str, list]
+) -> dict[str, list]:
+    """Posts a reminder for each live evolution that has newly entered a
+    reminder window (see EXPIRY_REMINDER_STAGES) and hasn't been notified
+    for that stage yet. Returns the updated notified map. Only ids present
+    in `evolutions` are kept -- ids for evolutions no longer live are
+    dropped so the state file doesn't grow forever."""
+    updated: dict[str, list] = {}
+    posted_count = 0
+
+    for item in evolutions:
+        evo = item["evolution"]
+        evo_id = str(evo["id"])
+        hours_left = hours_until(evo.get("endSubmissionTime"))
+        already = list(notified.get(evo_id, []))
+        updated[evo_id] = already  # carry forward; may append below
+
+        if hours_left is None or hours_left < 0:
+            continue  # no deadline data, or it already expired
+
+        for stage_name, stage_hours in EXPIRY_REMINDER_STAGES:
+            if hours_left > stage_hours:
+                continue  # not in this window yet
+            if stage_name in already:
+                continue  # already sent this one
+            print(
+                f"Posting expiring-evolution reminder ({stage_name}): "
+                f"{evo.get('name')} -- {hours_left:.1f}h left"
+            )
+            ok = post_webhook(
+                EXPIRING_EVOLUTIONS_WEBHOOK_URL,
+                f"{role_mention(EXPIRING_ROLE_ID)}Evolution expiring soon! \u23F0",
+                expiring_evolution_embed(item, hours_left),
+            )
+            if ok:
+                already.append(stage_name)
+                posted_count += 1
+                time.sleep(POST_DELAY_SECONDS)
+            else:
+                print(f"  will retry '{evo.get('name')}' ({stage_name}) on the next run")
+
+    print(f"Expiring evolutions: posted {posted_count} reminder(s).")
+    return updated
 
 
 def evolution_embed(item: dict) -> dict:
@@ -581,6 +697,7 @@ def main() -> int:
     evolutions: list[dict] = []
     sbcs: list[dict] = []
     objectives: list[dict] = []
+    evolutions_fetch_ok = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -589,6 +706,7 @@ def main() -> int:
         print("Fetching evolutions from fut.gg...")
         try:
             evolutions = fetch_evolutions(page)
+            evolutions_fetch_ok = True
             print(f"  found {len(evolutions)} live evolutions")
         except Exception as e:
             print(f"  ! failed to fetch evolutions, skipping this category this run: {e}")
@@ -647,6 +765,14 @@ def main() -> int:
             seen_ids=set(state["objectives_seen"]),
         )
     )
+
+    # Only check/update expiry reminders if the fetch actually succeeded --
+    # otherwise an empty `evolutions` list from a failed fetch would look
+    # like every evolution disappeared and wipe their notified-state.
+    if evolutions_fetch_ok:
+        state["evolutions_expiry_notified"] = check_expiring_evolutions(
+            evolutions, state.get("evolutions_expiry_notified", {})
+        )
 
     save_state(state)
     print("Done.")
