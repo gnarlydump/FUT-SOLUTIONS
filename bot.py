@@ -382,21 +382,21 @@ def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
     ]
     expires_est = format_expiry_est(evo.get("endSubmissionTime"))
     if expires_est:
-        fields.append({"name": "Expires (EST)", "value": expires_est, "inline": False})
+        fields.append({"name": "Expires (EST)", "value": expires_est, "inline": True})
     fields.append(
         {
-            "name": "Requirements to Unlock",
+            "name": "How to Unlock",
             "value": format_kv_lines(evo.get("requirementsText") or [], limit=20),
             "inline": False,
         }
     )
 
-    description = f"# {(evo.get('name') or 'Evolution')[:230]}"
+    description = f"**{(evo.get('name') or 'Evolution')[:230]}**"
     if name_line:
         description += f"\n{name_line}"
 
     embed = {
-        "title": "\u23F3 EXPIRES SOON",
+        "title": "\u23F3 Evolution Expiring Soon",
         "description": description,
         "color": EMBED_COLOR_EXPIRING,
         "fields": fields,
