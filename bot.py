@@ -332,23 +332,21 @@ def hours_minutes_left(hours_left: float) -> str:
 
 
 def format_expiry_est(iso_ts: str) -> str | None:
-    """Explicit Eastern-time date+time string (e.g. 'Aug 27, 2026, 3:24 PM
-    EDT') so everyone has one shared reference point regardless of their own
-    Discord timezone setting, rather than relying on Discord's per-viewer
-    auto-converting <t:...> tags. %Z resolves to EST or EDT automatically
-    depending on the date (daylight saving)."""
+    """Explicit, always-EST date+time string (e.g. 'Aug 27, 2026, 2:00 PM
+    EST') so everyone has one fixed, consistent reference point regardless
+    of their own Discord timezone setting or the time of year. Deliberately
+    uses a fixed UTC-5 offset year-round rather than America/New_York (which
+    would auto-shift to EDT in summer) -- one unchanging label is the whole
+    point here, not technically-correct-but-inconsistent labeling."""
     if not iso_ts:
         return None
     try:
         dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
     except ValueError:
         return None
-    try:
-        from zoneinfo import ZoneInfo
-        eastern = dt.astimezone(ZoneInfo("America/New_York"))
-    except Exception:
-        return None
-    return eastern.strftime("%b %d, %Y, %I:%M %p %Z").replace(" 0", " ")
+    from datetime import timedelta
+    fixed_est = dt.astimezone(timezone(timedelta(hours=-5)))
+    return fixed_est.strftime("%b %d, %Y, %I:%M %p EST").replace(" 0", " ")
 
 
 def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
