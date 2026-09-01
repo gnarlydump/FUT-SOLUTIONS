@@ -45,6 +45,8 @@ from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
 
+import cards
+
 FUTGG_BASE = "https://www.fut.gg"
 EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/"
 SBC_URL = f"{FUTGG_BASE}/sbc/"
@@ -277,6 +279,25 @@ def player_name(p: dict) -> str:
     return f"{p.get('firstName', '')} {p.get('lastName', '')}".strip()
 
 
+def truncate(text: str, limit: int) -> str:
+    """Truncates at the last word boundary within `limit` chars (instead of
+    slicing mid-word) and appends an ellipsis when anything was cut."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(".,;: ")
+    return (cut or text[:limit]) + "…"
+
+
+def format_kv_value(item: dict) -> str:
+    """Same value formatting as format_kv_lines(), for a single
+    requirement/upgrade row rendered into a card instead of Discord
+    markdown."""
+    value = item.get("value", "")
+    max_value = item.get("maxValue")
+    return f"{value} {max_value}" if max_value else str(value)
+
+
 def format_kv_lines(items: list[dict], limit: int = 12) -> str:
     """requirementsText / totalUpgradesText are lists of {label, value[, maxValue]}."""
     lines = []
@@ -450,10 +471,18 @@ def check_expiring_evolutions(
     return updated
 
 
-def evolution_embed(item: dict) -> dict:
+def build_evolution_card(item: dict, render_page) -> tuple[dict, bytes, str]:
+    """Builds the rendered PNG card plus a minimal Discord embed (title/url/
+    color/image-attachment) for a new Evolution. render_page is an
+    already-open Playwright page (see cards.render_card) reused across a
+    run's cards rather than opening a new browser per item."""
     evo = item["evolution"]
     base = item.get("basePlayer") or {}
     upgraded = item.get("upgradedPlayer") or {}
+
+    game_label = cards.detect_game_label(
+        upgraded.get("cardImageUrl"), base.get("cardImageUrl")
+    )
 
     price_bits = []
     if evo.get("coinsCost"):
@@ -464,50 +493,67 @@ def evolution_embed(item: dict) -> dict:
         price_bits.append(f"{evo['tokenCost']:,} tokens")
     price_text = " + ".join(price_bits) if price_bits else "Free"
 
-    name_line = ""
-    if base and upgraded:
-        name_line = (
-            f"{player_name(base)}: {base.get('overall', '?')} -> "
-            f"{upgraded.get('overall', '?')} OVR\n\n"
-        )
+    req_items = (evo.get("requirementsText") or [])[:3]
+    upg_items = (evo.get("totalUpgradesText") or [])[:3]
+    req_rows = "".join(
+        cards.row("🔒", r.get("label", ""), format_kv_value(r), True) for r in req_items
+    ) or cards.row("✅", "No restrictions", "Open to eligible players")
+    upg_rows = "".join(
+        cards.row("⬆️", r.get("label", ""), format_kv_value(r)) for r in upg_items
+    ) or cards.row("—", "No upgrade data", "")
 
-    description = name_line + (evo.get("description") or "")
+    left_html = f"""<div class="panel">
+      <div class="panel-head"><span>Entry Requirements</span><span class="count">{len(evo.get('requirementsText') or [])} conditions</span></div>
+      <div class="panel-body" style="flex:0.5;">{req_rows}</div>
+      <div class="subhead">Upgrades Applied</div>
+      <div class="panel-body" style="flex:0.5; padding-top:0;">{upg_rows}</div>
+    </div>"""
+
+    base_img = base.get("cardImageUrl")
+    upg_img = upgraded.get("cardImageUrl")
+    base_html = (
+        f'<div class="card-photo mini" style="background-image:url(\'{base_img}\')"></div>'
+        if base_img else '<div class="card-photo mini"></div>'
+    )
+    upg_html = (
+        f'<div class="card-photo" style="background-image:url(\'{upg_img}\')"></div>'
+        if upg_img else '<div class="card-photo"></div>'
+    )
+    name_line = (
+        f"{player_name(base)}: {base.get('overall', '?')} → {upgraded.get('overall', '?')} OVR"
+        if base and upgraded else ""
+    )
+    right_html = cards.panel(
+        "Evolution", "Base → Upgraded",
+        f"""<div class="reward-panel-body">
+          <div class="evo-pair">{base_html}<div class="arrow">→</div>{upg_html}</div>
+          <div class="card-cap"><div class="t">{name_line}</div><div class="s">{price_text}</div></div>
+        </div>""",
+        centered=True,
+    )
+
+    title = evo.get("name") or "New Evolution"
+    description = (evo.get("description") or "").strip()
+    html = cards.frame(
+        game_label, "NEW EVOLUTION", title,
+        truncate(description, 160) or "Unlock and upgrade an eligible player through staged challenges.",
+        left_html, right_html,
+        "⚡", f"{title} | EVOLUTION",
+        truncate(description, 120) or "New evolution available.",
+        f"⏱ Unlock within {relative_days(evo.get('endTime'))}",
+        f'<div class="chip status">⚠ Submit by {relative_days(evo.get("endSubmissionTime"))}</div>',
+    )
+    png = cards.render_card(render_page, html)
+    file_name = f"evolution_{evo.get('id', 'x')}.png"
 
     embed = {
-        "title": (evo.get("name") or "New Evolution")[:256],
-        "description": description[:4000],
+        "title": title[:256],
         "color": EMBED_COLOR_EVOLUTION,
-        "fields": [
-            {"name": "Price", "value": price_text, "inline": True},
-            {
-                "name": "Unlock Within",
-                "value": relative_days(evo.get("endTime")),
-                "inline": True,
-            },
-            {
-                "name": "Expires In",
-                "value": relative_days(evo.get("endSubmissionTime")),
-                "inline": True,
-            },
-            {
-                "name": "Requirements",
-                "value": format_kv_lines(evo.get("requirementsText") or []),
-                "inline": False,
-            },
-            {
-                "name": "Upgrades",
-                "value": format_kv_lines(evo.get("totalUpgradesText") or []),
-                "inline": False,
-            },
-        ],
+        "image": {"url": f"attachment://{file_name}"},
     }
     if evo.get("url"):
         embed["url"] = f"{FUTGG_BASE}{evo['url']}"
-    if upgraded.get("cardImageUrl"):
-        embed["image"] = {"url": upgraded["cardImageUrl"]}
-    if base.get("cardImageUrl"):
-        embed["thumbnail"] = {"url": base["cardImageUrl"]}
-    return embed
+    return embed, png, file_name
 
 
 def sbc_image_url(sbc: dict) -> str | None:
@@ -531,7 +577,16 @@ def sbc_image_url(sbc: dict) -> str | None:
     return None
 
 
-def sbc_embed(sbc: dict) -> dict:
+def build_sbc_card(sbc: dict, render_page) -> tuple[dict, bytes, str]:
+    """Builds the rendered PNG card plus a minimal Discord embed for a new
+    SBC. NOTE: fut.gg's SBC API (see SBC_API / fetch_sbcs()) only gives us
+    challengesCount, not each individual challenge's own requirement text
+    the way evolutions expose requirementsText -- so unlike the Evolution
+    card, this one can't show a real per-challenge breakdown. It shows what
+    the API actually gives us (cost, challenge count, expiry, description).
+    If fut.gg's SBC payload turns out to carry per-challenge requirements
+    under a different key, extending this to a real per-row breakdown is a
+    small follow-up, not a redesign."""
     cost_bits = []
     if sbc.get("cost"):
         cost_bits.append(f"{sbc['cost']:,} coins")
@@ -539,30 +594,62 @@ def sbc_embed(sbc: dict) -> dict:
         cost_bits.append(f"{sbc['costPc']:,} coins (PC)")
     cost_text = " / ".join(cost_bits) if cost_bits else "Unknown"
 
+    image_url = sbc_image_url(sbc)
+    game_label = cards.detect_game_label(image_url)
+
+    reward_label = "Reward"
+    for award in sbc.get("awards") or []:
+        player = award.get("player")
+        if player:
+            nm = player_name(player)
+            if nm:
+                reward_label = f"{nm} · {player.get('overall', '?')} OVR"
+            break
+
+    description = (sbc.get("description") or "").strip()
+    left_rows = cards.row("🪙", "Estimated Cost", cost_text, True)
+    left_rows += cards.row("🧩", "Challenges", str(sbc.get("challengesCount", "?")))
+    left_rows += cards.row("⏱", "Expires", relative_days(sbc.get("endTime")), True)
+    if description:
+        left_rows += cards.row("📋", "Details", truncate(description, 180))
+    left_html = cards.panel(
+        "SBC Details", f"{sbc.get('challengesCount', '?')} challenges", left_rows
+    )
+
+    reward_html = (
+        f'<div class="card-photo" style="background-image:url(\'{image_url}\')"></div>'
+        if image_url else '<div class="pack"><div class="glyph">🎁</div></div>'
+    )
+    title = sbc.get("name") or "New SBC"
+    right_html = cards.panel(
+        "Reward", reward_label,
+        f"""<div class="reward-panel-body">
+          {reward_html}
+          <div class="card-cap"><div class="t">{title}</div><div class="s">{reward_label}</div></div>
+        </div>""",
+        centered=True,
+    )
+
+    html = cards.frame(
+        game_label, "NEW SBC", title,
+        truncate(description, 160) or "Complete this squad building challenge to earn the reward.",
+        left_html, right_html,
+        "🛡️", f"{title} | SBC",
+        truncate(description, 120) or "New squad building challenge available.",
+        f"⏱ Expires {relative_days(sbc.get('endTime'))}",
+        f'<div class="chip">🧩 {sbc.get("challengesCount", "?")} challenges</div>',
+    )
+    png = cards.render_card(render_page, html)
+    file_name = f"sbc_{sbc.get('id', 'x')}.png"
+
     embed = {
-        "title": (sbc.get("name") or "New SBC")[:256],
-        "description": (sbc.get("description") or "")[:4000],
+        "title": title[:256],
         "color": EMBED_COLOR_SBC,
-        "fields": [
-            {"name": "Estimated Cost", "value": cost_text, "inline": True},
-            {
-                "name": "Challenges",
-                "value": str(sbc.get("challengesCount", "?")),
-                "inline": True,
-            },
-            {
-                "name": "Expires",
-                "value": relative_days(sbc.get("endTime")),
-                "inline": True,
-            },
-        ],
+        "image": {"url": f"attachment://{file_name}"},
     }
     if sbc.get("url"):
         embed["url"] = f"{FUTGG_BASE}{sbc['url']}"
-    image_url = sbc_image_url(sbc)
-    if image_url:
-        embed["image"] = {"url": image_url}
-    return embed
+    return embed, png, file_name
 
 
 def objective_image_url(obj: dict) -> str | None:
@@ -580,33 +667,64 @@ def objective_image_url(obj: dict) -> str | None:
     return None
 
 
-def objective_embed(obj: dict) -> dict:
+def build_objective_card(obj: dict, render_page) -> tuple[dict, bytes, str]:
+    """Builds the rendered PNG card plus a minimal Discord embed for a new
+    Objective. Same caveat as build_sbc_card(): fut.gg gives us tasksCount,
+    not each task's own text, so the task list shows what's actually
+    available rather than a fabricated per-task breakdown."""
     category = (obj.get("category") or {}).get("name", "Objective")
+    awards = obj.get("awards") or []
+    first = awards[0] if awards else {}
+    player_item = first.get("playerItem") or {}
+    reward_card_url = player_item.get("cardImageUrl")
+    game_label = cards.detect_game_label(reward_card_url)
+
+    description = (obj.get("description") or "").strip()
+    left_rows = cards.row("🏷️", "Category", category, True)
+    left_rows += cards.row("☑️", "Tasks", str(obj.get("tasksCount", "?")))
+    left_rows += cards.row("⏱", "Expires", relative_days(obj.get("endTime")), True)
+    if description:
+        left_rows += cards.row("📋", "Details", truncate(description, 180))
+    left_html = cards.panel("Objective Details", category, left_rows)
+
+    image_url = objective_image_url(obj)
+    if reward_card_url:
+        reward_html = f'<div class="card-photo" style="background-image:url(\'{reward_card_url}\')"></div>'
+    elif image_url:
+        reward_html = f'<div class="pack" style="background-image:url(\'{image_url}\')"></div>'
+    else:
+        reward_html = '<div class="pack"><div class="glyph">🎁</div></div>'
+
+    title = obj.get("name") or "New Objective"
+    right_html = cards.panel(
+        "Reward", "Untradeable",
+        f"""<div class="reward-panel-body">
+          {reward_html}
+          <div class="card-cap"><div class="t">{title}</div><div class="s">{category}</div></div>
+        </div>""",
+        centered=True,
+    )
+
+    html = cards.frame(
+        game_label, "NEW OBJECTIVE", title,
+        truncate(description, 160) or f"{category} objective — complete all tasks before it expires.",
+        left_html, right_html,
+        "🎯", f"{title} | OBJECTIVE",
+        truncate(description, 120) or "New objective available.",
+        f"⏱ Expires {relative_days(obj.get('endTime'))}",
+        f'<div class="chip status">☐ TASKS 0/{obj.get("tasksCount", "?")}</div>',
+    )
+    png = cards.render_card(render_page, html)
+    file_name = f"objective_{obj.get('id', 'x')}.png"
 
     embed = {
-        "title": (obj.get("name") or "New Objective")[:256],
-        "description": (obj.get("description") or "")[:4000],
+        "title": title[:256],
         "color": EMBED_COLOR_OBJECTIVE,
-        "fields": [
-            {"name": "Category", "value": category, "inline": True},
-            {
-                "name": "Tasks",
-                "value": str(obj.get("tasksCount", "?")),
-                "inline": True,
-            },
-            {
-                "name": "Expires",
-                "value": relative_days(obj.get("endTime")),
-                "inline": True,
-            },
-        ],
+        "image": {"url": f"attachment://{file_name}"},
     }
     if obj.get("slug"):
         embed["url"] = f"{FUTGG_BASE}/objectives/{obj['slug']}/"
-    image_url = objective_image_url(obj)
-    if image_url:
-        embed["image"] = {"url": image_url}
-    return embed
+    return embed, png, file_name
 
 
 # ---------------------------------------------------------------------------
@@ -689,14 +807,17 @@ def process_category(
     items: list[dict],
     get_id,
     get_name,
-    embed_fn,
+    build_fn,
     webhook_url: str,
     announce_text: str,
     seen_ids: set,
 ) -> set:
     """Diffs `items` against `seen_ids`, posts anything new to `webhook_url`,
     and returns the updated set of seen ids (failed posts are left out so
-    they're retried on the next run)."""
+    they're retried on the next run). `build_fn(item)` returns
+    (embed, png_bytes, file_name) -- see build_sbc_card / build_evolution_card
+    / build_objective_card -- and the rendered PNG is attached to the post
+    alongside the (minimal) embed."""
     first_run = not seen_ids
     all_ids = {get_id(item) for item in items}
     new_items = [] if first_run else [i for i in items if get_id(i) not in seen_ids]
@@ -709,7 +830,15 @@ def process_category(
     for i, item in enumerate(new_items):
         name = get_name(item)
         print(f"Posting new {label[:-1] if label.endswith('s') else label}: {name}")
-        ok = post_webhook(webhook_url, announce_text, embed_fn(item))
+        try:
+            embed, png_bytes, file_name = build_fn(item)
+        except Exception as e:
+            print(f"  ! failed to render card for '{name}', skipping this run: {e}")
+            failed_ids.add(get_id(item))
+            continue
+        ok = post_webhook(
+            webhook_url, announce_text, embed, file_bytes=png_bytes, file_name=file_name
+        )
         if ok:
             posted_count += 1
         else:
@@ -772,44 +901,57 @@ def main() -> int:
 
         browser.close()
 
-    state["evolutions_seen"] = sorted(
-        process_category(
-            "evolutions",
-            evolutions,
-            get_id=lambda item: item["evolution"]["id"],
-            get_name=lambda item: item["evolution"]["name"],
-            embed_fn=evolution_embed,
-            webhook_url=EVOLUTIONS_WEBHOOK_URL,
-            announce_text=f"{role_mention(EVOLUTIONS_ROLE_ID)}New evolution(s) added! \U0001F6A8",
-            seen_ids=set(state["evolutions_seen"]),
+    # Card rendering needs its own browser page -- the one used for
+    # scraping above is already closed by this point, and rendering only
+    # needs a blank page to load our own HTML into (plus real network
+    # access to fetch each card's fut.gg image URLs, which the runner has
+    # even though this repo's local dev sandbox might not).
+    with sync_playwright() as p:
+        render_browser = p.chromium.launch()
+        render_page = render_browser.new_page(
+            viewport={"width": 1080, "height": 900}, device_scale_factor=2
         )
-    )
 
-    state["sbcs_seen"] = sorted(
-        process_category(
-            "sbcs",
-            sbcs,
-            get_id=lambda item: item["id"],
-            get_name=lambda item: item["name"],
-            embed_fn=sbc_embed,
-            webhook_url=SBC_WEBHOOK_URL,
-            announce_text=f"{role_mention(SBC_ROLE_ID)}New SBC(s) added! \U0001F6A8",
-            seen_ids=set(state["sbcs_seen"]),
+        state["evolutions_seen"] = sorted(
+            process_category(
+                "evolutions",
+                evolutions,
+                get_id=lambda item: item["evolution"]["id"],
+                get_name=lambda item: item["evolution"]["name"],
+                build_fn=lambda item: build_evolution_card(item, render_page),
+                webhook_url=EVOLUTIONS_WEBHOOK_URL,
+                announce_text=f"{role_mention(EVOLUTIONS_ROLE_ID)}New evolution(s) added! \U0001F6A8",
+                seen_ids=set(state["evolutions_seen"]),
+            )
         )
-    )
 
-    state["objectives_seen"] = sorted(
-        process_category(
-            "objectives",
-            objectives,
-            get_id=lambda item: item["id"],
-            get_name=lambda item: item["name"],
-            embed_fn=objective_embed,
-            webhook_url=OBJECTIVES_WEBHOOK_URL,
-            announce_text=f"{role_mention(OBJECTIVES_ROLE_ID)}New objective(s) added! \U0001F6A8",
-            seen_ids=set(state["objectives_seen"]),
+        state["sbcs_seen"] = sorted(
+            process_category(
+                "sbcs",
+                sbcs,
+                get_id=lambda item: item["id"],
+                get_name=lambda item: item["name"],
+                build_fn=lambda item: build_sbc_card(item, render_page),
+                webhook_url=SBC_WEBHOOK_URL,
+                announce_text=f"{role_mention(SBC_ROLE_ID)}New SBC(s) added! \U0001F6A8",
+                seen_ids=set(state["sbcs_seen"]),
+            )
         )
-    )
+
+        state["objectives_seen"] = sorted(
+            process_category(
+                "objectives",
+                objectives,
+                get_id=lambda item: item["id"],
+                get_name=lambda item: item["name"],
+                build_fn=lambda item: build_objective_card(item, render_page),
+                webhook_url=OBJECTIVES_WEBHOOK_URL,
+                announce_text=f"{role_mention(OBJECTIVES_ROLE_ID)}New objective(s) added! \U0001F6A8",
+                seen_ids=set(state["objectives_seen"]),
+            )
+        )
+
+        render_browser.close()
 
     # Only check/update expiry reminders if the fetch actually succeeded --
     # otherwise an empty `evolutions` list from a failed fetch would look
