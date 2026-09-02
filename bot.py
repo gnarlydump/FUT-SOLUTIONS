@@ -45,16 +45,20 @@ from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
 
-FUTGG_BASE = "https://www.fut.gg"
-EVOLUTIONS_URL = f"{FUTGG_BASE}/evolutions/"
-SBC_URL = f"{FUTGG_BASE}/sbc/"
-OBJECTIVES_URL = f"{FUTGG_BASE}/objectives/"
+FUTGG_BASE = os.environ.get("FUTGG_BASE", "https://www.fut.gg")
+# Overridable so a fut.gg path change at the FC 27 rollover is a workflow
+# variable, not a code edit and a redeploy. The scrapers already match on
+# the SHAPE of the page data rather than route ids, so a rename usually
+# only moves the URL.
+EVOLUTIONS_URL = os.environ.get("EVOLUTIONS_URL") or f"{FUTGG_BASE}/evolutions/"
+SBC_URL = os.environ.get("SBC_URL") or f"{FUTGG_BASE}/sbc/"
+OBJECTIVES_URL = os.environ.get("OBJECTIVES_URL") or f"{FUTGG_BASE}/objectives/"
 # fut.gg's SBC list page used to embed every SBC in the page's initial
 # loaderData (loaderData.allSbcs). fut.gg restructured that page at some
 # point to only load category summaries up front and fetch the actual SBC
 # sets client-side (via React Query) from this paginated endpoint instead.
 # {page} is 1-indexed; the response has {data: [...], next, totalPages}.
-SBC_API = f"{FUTGG_BASE}/api/fut/sbc/"
+SBC_API = os.environ.get("SBC_API") or f"{FUTGG_BASE}/api/fut/sbc/"
 
 STATE_PATH = Path(__file__).parent / "state" / "state.json"
 
@@ -62,6 +66,9 @@ EVOLUTIONS_WEBHOOK_URL = os.environ.get("EVOLUTIONS_WEBHOOK_URL", "")
 SBC_WEBHOOK_URL = os.environ.get("SBC_WEBHOOK_URL", "")
 OBJECTIVES_WEBHOOK_URL = os.environ.get("OBJECTIVES_WEBHOOK_URL", "")
 EXPIRING_EVOLUTIONS_WEBHOOK_URL = os.environ.get("EXPIRING_EVOLUTIONS_WEBHOOK_URL", "")
+# Where scraper-health warnings go. Falls back to the evolutions webhook,
+# so this works without any new configuration.
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "")
 
 # Optional: Discord role IDs to @-mention when posting. If left blank, the
 # post still goes out, just without a role ping. These correspond to the
@@ -106,6 +113,15 @@ MAX_BACKFILL = 25
 POST_FORMAT_VERSION = 1
 BACKFILL_ON_UPDATE = 5
 
+# The most items one category will post in a single run. A new game turns
+# the whole fut.gg catalogue over at once -- every FC 27 item is an id
+# we've never seen, so without this the first run after launch would dump
+# the entire catalogue into the channel. Anything past the cap is marked
+# seen and NOT posted, with a note on the announcement saying how many
+# were held back, so the channel stays readable and nobody is left
+# wondering what they missed.
+MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN") or 12)
+
 DEFAULT_STATE = {
     "evolutions_seen": [],
     "sbcs_seen": [],
@@ -125,6 +141,32 @@ DEFAULT_STATE = {
 # Set by main() when the state's recorded post format is out of date. Env
 # BACKFILL_COUNT still wins, so a manual run can ask for a different size.
 _AUTO_BACKFILL = 0
+
+
+def warn_channel(message: str) -> None:
+    """Tells a human that the scraper has stopped working.
+
+    Every failure so far has been silent -- the cron trigger 404ing after
+    a repo rename, an asset path that made every render throw. The bot
+    logged it, GitHub went green, and the channels just went quiet for
+    days. A category that suddenly yields nothing is the same shape of
+    problem, so it goes somewhere a person will actually see.
+
+    Falls back to the evolutions webhook when no dedicated alert hook is
+    configured, and never raises -- a failed warning must not take the
+    run down with it."""
+    url = ALERT_WEBHOOK_URL or EVOLUTIONS_WEBHOOK_URL
+    print(f"  !! {message}")
+    if not url:
+        return
+    try:
+        post_webhook(url, "", {
+            "title": "\u26a0\ufe0f fut.gg scraper needs a look",
+            "description": message[:4000],
+            "color": EMBED_COLOR_EXPIRING,
+        })
+    except Exception as e:
+        print(f"  ! (couldn't post the warning either: {e})")
 
 
 def backfill_count() -> int:
@@ -349,6 +391,15 @@ def format_kv_lines(items: list[dict], limit: int = 12) -> str:
     return "\n".join(lines) if lines else "None"
 
 
+def truncate_field(text: str) -> str:
+    """Keeps a field value inside Discord's 1024-character limit, cutting
+    at a separator so the line never ends mid-name."""
+    if len(text) <= EMBED_FIELD_LIMIT:
+        return text
+    cut = text[:EMBED_FIELD_LIMIT - 2].rsplit(" \u00b7 ", 1)[0]
+    return cut + " \u2026"
+
+
 def kv_fields(name: str, items: list[dict]) -> list[dict]:
     """The SAME list, as however many embed fields it takes to show all of
     it -- no "...and 3 more".
@@ -549,6 +600,168 @@ def check_expiring_evolutions(
     return updated
 
 
+# ---------------------------------------------------------------------------
+# PlayStyles and roles
+#
+# fut.gg's field names for these are not documented and have changed
+# before, so nothing here matches on a field NAME. Instead we walk the
+# whole player payload and keep any string that IS a known PlayStyle or
+# role. That means a rename on their side costs nothing, and a field we've
+# never seen still works the moment it carries real names.
+#
+# The trade-off is the opposite failure: if fut.gg simply doesn't carry
+# them, these return [] and the embed shows no section at all -- which is
+# the right outcome. An empty "PlayStyles" heading would be worse than none.
+# ---------------------------------------------------------------------------
+
+# Every PlayStyle in FC 26. A name FC 27 adds is simply not matched until
+# it's added here -- it is never guessed at.
+PLAYSTYLE_NAMES = {
+    "acrobatic", "aerial fortress", "anticipate", "block", "bruiser",
+    "chip shot", "cross claimer", "dead ball", "deflector", "enforcer",
+    "far reach", "far throw", "finesse shot", "first touch", "footwork",
+    "game changer", "incisive pass", "intercept", "inventive", "jockey",
+    "long ball pass", "long throw", "low driven shot", "pinged pass",
+    "power shot", "precision header", "press proven", "quick step",
+    "rapid", "relentless", "rush out", "slide tackle", "technical",
+    "tiki taka", "trickster", "whipped pass"
+}
+
+ROLE_NAMES = {
+    # goalkeeper
+    "goalkeeper", "sweeper keeper",
+    # defenders
+    "fullback", "falseback", "wingback", "offensive wingback",
+    "inverted wingback", "defender", "stopper", "ball playing defender",
+    # midfield
+    "holding", "centre half", "center half", "deep lying playmaker",
+    "wide half", "box crasher", "box to box", "playmaker", "half winger",
+    "holding midfielder",
+    # wide / attack
+    "winger", "inside forward", "wide playmaker", "classic winger",
+    "advance forward", "advanced forward", "poacher", "false 9",
+    "target forward", "shadow striker",
+}
+
+# Long strings are never names. Guards against a description or a data URI
+# happening to contain "block" or "rapid".
+MAX_STYLE_NAME_LEN = 40
+
+
+def _clean(value) -> str:
+    """The comparable form of a payload value, or "" if it can't be a name."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > MAX_STYLE_NAME_LEN:
+        return ""
+    if any(c in text for c in "/:;{}<>\n"):
+        return ""
+    return text.rstrip("+").strip().lower()
+
+
+def _walk_names(node, vocab, on_match, plus=0):
+    """Depth-first walk keeping track of whether the KEY PATH implies a
+    tier -- fut.gg expresses PlayStyle+ as a separate `playStylesPlus`
+    list rather than a suffix on the name."""
+    if isinstance(node, dict):
+        # A dict that names a style/role AND carries its level numerically
+        # -- {"name": "Holding", "familiarity": 2} -- is the whole entry.
+        # Read the level off the sibling key and stop: recursing would
+        # find the name with no level attached and report Holding+ for
+        # what is actually Holding++.
+        name_val = node.get("name") or node.get("role") or node.get("label")
+        slug = _clean(name_val)
+        if slug in vocab:
+            level = None
+            for key, value in node.items():
+                if str(key).lower() in ("familiarity", "level", "tier", "rank"):
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        level = value
+                        break
+            raw = str(name_val).strip()
+            if raw.endswith("++"):
+                tier = 2
+            elif raw.endswith("+"):
+                tier = 1
+            elif level is not None:
+                tier = level
+            else:
+                tier = plus
+            on_match(slug, tier)
+            return
+        for key, value in node.items():
+            k = str(key).lower()
+            depth = 2 if ("plusplus" in k or "++" in k) else (1 if "plus" in k else plus)
+            _walk_names(value, vocab, on_match, depth)
+    elif isinstance(node, list):
+        for entry in node:
+            _walk_names(entry, vocab, on_match, plus)
+    else:
+        slug = _clean(node)
+        if slug in vocab:
+            raw = str(node).strip()
+            tier = 2 if raw.endswith("++") else (1 if raw.endswith("+") else plus)
+            on_match(slug, tier)
+
+
+def extract_playstyles(player: dict) -> list[str]:
+    """PlayStyle names, with a "+" on the upgraded tier.
+
+    A PlayStyle has exactly two tiers, base and +. The double "++" belongs
+    to roles and is never used here."""
+    if not player:
+        return []
+    found, order = {}, []
+
+    def note(slug, tier):
+        if slug not in found:
+            order.append(slug)
+            found[slug] = 0
+        found[slug] = max(found[slug], min(tier, 1))
+
+    _walk_names(player, PLAYSTYLE_NAMES, note)
+    return [slug.title() + ("+" if found[slug] else "") for slug in order]
+
+
+def extract_roles(player: dict) -> list[str]:
+    """Role names with their familiarity suffix.
+
+    Role familiarity has two levels, + and ++, and there is no bare role --
+    so anything found without an explicit level is reported as "+", never
+    suffix-less."""
+    if not player:
+        return []
+    found, order = {}, []
+
+    def note(slug, tier):
+        if slug not in found:
+            order.append(slug)
+            found[slug] = 1
+        found[slug] = max(found[slug], min(max(tier, 1), 2))
+
+    _walk_names(player, ROLE_NAMES, note)
+    return [slug.title() + "+" * found[slug] for slug in order]
+
+
+def gained(after: list[str], before: list[str]) -> list[str]:
+    """The entries an evolution ADDS or RAISES.
+
+    Compared per item, so it holds for whatever a future evolution happens
+    to change. With no "before" data to compare against there is nothing
+    to claim, so it returns nothing rather than presenting the finished
+    player's whole list as a gain."""
+    if not before:
+        return []
+    was = {b.rstrip("+").lower(): b.count("+") for b in before}
+    out = []
+    for item in after:
+        name, plus = item.rstrip("+").lower(), item.count("+")
+        if name not in was or plus > was[name]:
+            out.append(item)
+    return out
+
+
 def evolution_embed(item: dict) -> dict:
     evo = item["evolution"]
     base = item.get("basePlayer") or {}
@@ -605,6 +818,31 @@ def evolution_embed(item: dict) -> dict:
     # takes -- see kv_fields().
     embed["fields"] += kv_fields("Requirements", evo.get("requirementsText") or [])
     embed["fields"] += kv_fields("Upgrades", evo.get("totalUpgradesText") or [])
+
+    # What the evolution gives beyond raw stats. Where we can compare
+    # against the pre-evolution player we show only what it ADDS or
+    # RAISES, since that is what the reader is deciding on; with nothing
+    # to compare we list what the finished player has and say so, rather
+    # than passing off their existing PlayStyles as a gain. Either way the
+    # section is omitted entirely when there is nothing to show.
+    for heading, after, before in (
+        ("PlayStyles", extract_playstyles(upgraded), extract_playstyles(base)),
+        ("Roles", extract_roles(upgraded), extract_roles(base)),
+    ):
+        if not after:
+            continue
+        new_ones = gained(after, before)
+        if new_ones:
+            name, values = f"{heading} Gained", new_ones
+        elif before:
+            continue          # nothing new -- the evo doesn't touch these
+        else:
+            name, values = f"{heading} (after evo)", after
+        embed["fields"].append({
+            "name": name,
+            "value": truncate_field(" \u00b7 ".join(values)),
+            "inline": False,
+        })
 
     if evo.get("url"):
         embed["url"] = f"{FUTGG_BASE}{evo['url']}"
@@ -826,6 +1064,20 @@ def process_category(
         if first_run:
             print(f"First run for {label}: seeding {len(items)} item(s) without posting.")
 
+    # A game rollover makes every item new at once. Post a readable number
+    # and mark the rest seen rather than dumping a whole catalogue into the
+    # channel; the announcement says how many were held back so nobody is
+    # left wondering.
+    held_back = 0
+    if not backfill and len(new_items) > MAX_POSTS_PER_RUN:
+        held_back = len(new_items) - MAX_POSTS_PER_RUN
+        print(f"  ! {len(new_items)} new {label} in one run -- posting "
+              f"{MAX_POSTS_PER_RUN} and marking the other {held_back} as seen "
+              f"without posting (MAX_POSTS_PER_RUN).")
+        new_items = new_items[:MAX_POSTS_PER_RUN]
+    if held_back:
+        announce_text = f"{announce_text} (+{held_back} more not shown)"
+
     failed_ids = set()
     posted_count = 0
     announced = False
@@ -886,6 +1138,7 @@ def main() -> int:
     sbcs: list[dict] = []
     objectives: list[dict] = []
     evolutions_fetch_ok = False
+    fetch_errors: list[str] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -898,6 +1151,7 @@ def main() -> int:
             print(f"  found {len(evolutions)} live evolutions")
         except Exception as e:
             print(f"  ! failed to fetch evolutions, skipping this category this run: {e}")
+            fetch_errors.append(f"evolutions: {e}")
 
         print("Fetching SBCs from fut.gg...")
         try:
@@ -905,6 +1159,7 @@ def main() -> int:
             print(f"  found {len(sbcs)} live SBCs")
         except Exception as e:
             print(f"  ! failed to fetch SBCs, skipping this category this run: {e}")
+            fetch_errors.append(f"SBCs: {e}")
 
         print("Fetching objectives from fut.gg...")
         try:
@@ -912,8 +1167,30 @@ def main() -> int:
             print(f"  found {len(objectives)} live objectives")
         except Exception as e:
             print(f"  ! failed to fetch objectives, skipping this category this run: {e}")
+            fetch_errors.append(f"objectives: {e}")
 
         browser.close()
+
+    # A category that returns nothing while the state says it used to hold
+    # hundreds of ids means fut.gg moved something -- exactly the kind of
+    # break that would otherwise just look like a quiet week. Say so out
+    # loud; the FC 27 rollover is when this is most likely to happen.
+    for label, items, seen_key in (("evolutions", evolutions, "evolutions_seen"),
+                                   ("SBCs", sbcs, "sbcs_seen"),
+                                   ("objectives", objectives, "objectives_seen")):
+        if not items and state.get(seen_key):
+            fetch_errors.append(
+                f"{label}: fut.gg returned 0 items, but {len(state[seen_key])} "
+                f"have been seen before -- the page has probably moved or "
+                f"changed shape."
+            )
+    if fetch_errors:
+        warn_channel(
+            "The bot could not read fut.gg properly this run:\n\n- "
+            + "\n- ".join(fetch_errors)
+            + "\n\nNothing was posted for those categories. If this repeats, "
+              "the page URL or data shape has likely changed."
+        )
 
     state["evolutions_seen"] = sorted(
         process_category(
