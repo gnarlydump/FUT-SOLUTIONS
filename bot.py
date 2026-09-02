@@ -37,6 +37,7 @@ Role pings:
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -511,7 +512,7 @@ def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
     if evo.get("pointsCost"):
         price_bits.append(f"{evo['pointsCost']:,} points")
     if evo.get("tokenCost"):
-        price_bits.append(f"{evo['tokenCost']:,} tokens")
+        price_bits.append(token_price(evo["tokenCost"], evo))
     # Coins, FC Points and tokens are ALTERNATIVE ways to pay for an
     # evolution, not a combined bill -- joining them with "+" overstated
     # the cost.
@@ -531,15 +532,18 @@ def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
     expires_est = format_expiry_est(evo.get("endSubmissionTime"))
     if expires_est:
         fields.append({"name": "Expires (EST)", "value": expires_est, "inline": True})
-    fields.append(
-        {
-            "name": "How to Unlock",
-            "value": format_kv_lines(evo.get("requirementsText") or [], limit=20),
-            "inline": False,
-        }
-    )
+    # requirementsText is ELIGIBILITY -- who is allowed to use this evo
+    # (Max OVR 96, Position ST, Max PS+ 4). Labelling it "How to Unlock"
+    # told people it was what they had to DO to complete it, which is a
+    # different thing fut.gg exposes separately. Same wording as the new
+    # evolution post, and every line rather than the first 20.
+    fields += kv_fields("Requirements", evo.get("requirementsText") or [])
 
-    description = f"**{(evo.get('name') or 'Evolution')[:230]}**"
+    # The evolution's name is what tells one of these posts from another,
+    # so it gets a markdown heading rather than plain bold -- Discord
+    # renders "##" noticeably larger than bold body text, which is all it
+    # was before. The banner stays as the title.
+    description = f"## {(evo.get('name') or 'Evolution')[:230]}"
     if name_line:
         description += f"\n{name_line}"
 
@@ -762,6 +766,90 @@ def gained(after: list[str], before: list[str]) -> list[str]:
     return out
 
 
+# "200 tokens" tells a reader nothing -- FUT tokens are always tied to a
+# campaign (Pre-Season, Rush, Ultimate Rewind...) and which one decides
+# whether they even have any. fut.gg carries the campaign name, but in
+# prose ("Unlocked from the pre-season token store") rather than as a
+# tidy field, so we look for it both ways.
+_TOKEN_PHRASE_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9'\-]*(?:\s+[A-Za-z][A-Za-z0-9'\-]*){0,2})\s+tokens?\b",
+    re.IGNORECASE,
+)
+# Words that are grammar around the phrase, not part of the campaign name.
+_TOKEN_STOPWORDS = {
+    "the", "a", "an", "of", "in", "from", "with", "for", "your", "these",
+    "those", "this", "that", "and", "or", "using", "use", "spend", "costs",
+    "cost", "requires", "required", "unlocked", "unlock", "earn", "earned",
+    "more", "extra", "some", "any", "all", "free", "event",
+}
+MAX_TOKEN_LABEL_LEN = 30
+
+
+def token_label(evo: dict) -> str:
+    """Which campaign's tokens an evolution is priced in, or "".
+
+    Tries a field naming the token first, then the prose fut.gg actually
+    uses. Returns "" rather than a guess when nothing reads like a
+    campaign name -- "200 tokens" is vague, but a wrong campaign name is
+    worse than a vague one."""
+    if not isinstance(evo, dict):
+        return ""
+
+    # A field that names the token outright, whatever it's called.
+    for key, value in evo.items():
+        k = str(key).lower()
+        if "token" not in k or "cost" in k or "count" in k:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text and len(text) <= MAX_TOKEN_LABEL_LEN and "://" not in text:
+                # A field that names the token IS the name -- use it as
+                # written. Stripping grammar words from it turned "Team of
+                # the Week" into "Team Week".
+                return text
+
+    # Otherwise the prose. Checked in a stable order so the same payload
+    # always produces the same answer.
+    for key in ("unlockMethod", "acquisition", "howToGet", "description",
+                "subtitle", "summary"):
+        text = evo.get(key)
+        if not isinstance(text, str):
+            continue
+        for match in _TOKEN_PHRASE_RE.finditer(text):
+            label = _clean_token_label(match.group(1))
+            if label:
+                return label
+    return ""
+
+
+def _clean_token_label(text: str) -> str:
+    """Strips the grammar off a phrase captured from PROSE and title-cases
+    what's left, or returns "" if nothing meaningful survives.
+
+    Only for prose. A field that names the token outright is used
+    verbatim -- see token_label()."""
+    words = [w for w in re.split(r"\s+", text.strip())
+             if w and w.lower() not in _TOKEN_STOPWORDS]
+    if not words:
+        return ""
+    label = " ".join(words)
+    if len(label) > MAX_TOKEN_LABEL_LEN:
+        return ""
+    # Capitalise per WORD and per hyphen segment: "pre-season" ->
+    # "Pre-Season", "ultimate rewind" -> "Ultimate Rewind". Doing only the
+    # hyphen split lowercased the second word of a two-word campaign.
+    return " ".join(
+        "-".join(seg.capitalize() for seg in word.split("-"))
+        for word in label.split()
+    )
+
+
+def token_price(count: int, evo: dict) -> str:
+    """The token price, naming the campaign when we can identify it."""
+    label = token_label(evo)
+    return f"{count:,} {label} Tokens" if label else f"{count:,} tokens"
+
+
 def evolution_embed(item: dict) -> dict:
     evo = item["evolution"]
     base = item.get("basePlayer") or {}
@@ -773,7 +861,7 @@ def evolution_embed(item: dict) -> dict:
     if evo.get("pointsCost"):
         price_bits.append(f"{evo['pointsCost']:,} points")
     if evo.get("tokenCost"):
-        price_bits.append(f"{evo['tokenCost']:,} tokens")
+        price_bits.append(token_price(evo["tokenCost"], evo))
     # Coins, FC Points and tokens are ALTERNATIVE ways to pay for an
     # evolution, not a combined bill -- joining them with "+" overstated
     # the cost.
