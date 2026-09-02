@@ -35,8 +35,10 @@ Role pings:
   without a ping for that category.
 """
 
+import base64
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -96,6 +98,17 @@ EXPIRY_REMINDER_STAGES = [
 # Discord will reject the message. This is the pause between each post.
 POST_DELAY_SECONDS = 1.5
 
+# Ceiling on BACKFILL_COUNT. A backfill posts straight into live community
+# channels, so the cap is what stops a mistyped value flooding them.
+MAX_BACKFILL = 25
+
+# Bump this whenever the cards change enough to be worth showing off. The
+# first run on a version the state hasn't recorded republishes the newest
+# BACKFILL_ON_UPDATE items of each category, so the redesign lands in the
+# channels by itself rather than waiting for enough new content to appear.
+CARD_DESIGN_VERSION = 2
+BACKFILL_ON_UPDATE = 5
+
 DEFAULT_STATE = {
     "evolutions_seen": [],
     "sbcs_seen": [],
@@ -104,7 +117,42 @@ DEFAULT_STATE = {
     # strings) -> list of reminder stage names already posted for it, e.g.
     # {"1234": ["48h"]}. Prevents re-posting the same reminder every hour.
     "evolutions_expiry_notified": {},
+    # The card design the channels have already seen. When this doesn't
+    # match CARD_DESIGN_VERSION the next run republishes a few recent
+    # items so the channels show the new design without anyone having to
+    # trigger anything. 0 means "never recorded", which is the state every
+    # existing deployment is in.
+    "card_design_version": 0,
 }
+
+
+# Set by main() when the state's recorded card design is out of date. Env
+# BACKFILL_COUNT still wins, so a manual run can ask for a different size.
+_AUTO_BACKFILL = 0
+
+
+def backfill_count() -> int:
+    """How many items per category this run should repost regardless of
+    what's already been posted, or 0 for normal behaviour.
+
+    Comes from BACKFILL_COUNT for a deliberate manual run, or from the
+    automatic one-shot after a card redesign (see CARD_DESIGN_VERSION).
+    Capped either way: this posts to live community channels, so a typo
+    shouldn't be able to dump hundreds of messages into them."""
+    raw = (os.environ.get("BACKFILL_COUNT") or "").strip()
+    if not raw:
+        return min(_AUTO_BACKFILL, MAX_BACKFILL)
+    try:
+        n = int(raw)
+    except ValueError:
+        print(f"  ! BACKFILL_COUNT={raw!r} is not a number -- ignoring.")
+        return 0
+    if n <= 0:
+        return 0
+    if n > MAX_BACKFILL:
+        print(f"  ! BACKFILL_COUNT={n} exceeds the {MAX_BACKFILL} cap -- using {MAX_BACKFILL}.")
+        return MAX_BACKFILL
+    return n
 
 
 def role_mention(role_id: str) -> str:
@@ -471,77 +519,214 @@ def check_expiring_evolutions(
     return updated
 
 
+_CARD_IMAGE_CACHE: dict[str, bytes | None] = {}
+
+
+def fetch_card_image(url: str) -> bytes | None:
+    """Downloads a card image so its numbers can be repainted. Cached per
+    run; any failure returns None and the card is used as-is."""
+    if not url or url.startswith("data:"):
+        return None
+    if url in _CARD_IMAGE_CACHE:
+        return _CARD_IMAGE_CACHE[url]
+    data = None
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.ok:
+            data = resp.content
+    except Exception as e:
+        print(f"  ! couldn't fetch card image: {e}")
+    _CARD_IMAGE_CACHE[url] = data
+    return data
+
+
+def evolved_card_image(url: str, base: dict, upgraded: dict) -> str | None:
+    """Returns a data URI for the card with the evolution's resulting face
+    stats painted in, or None to fall back to the original artwork."""
+    raw = fetch_card_image(url)
+    if not raw:
+        return None
+    try:
+        out = cards.composite_evolved_card(raw, base, upgraded)
+    except Exception as e:
+        print(f"  ! couldn't repaint card stats: {e}")
+        return None
+    if not out:
+        return None
+    return "data:image/png;base64," + base64.b64encode(out).decode("ascii")
+
+
+# The reference layout groups an evolution's upgrades the way the game
+# does: the six face stats first, then the detailed in-game attributes,
+# then everything that isn't a stat at all.
+FACE_STAT_LABELS = {
+    "pace", "shooting", "passing", "dribbling", "defending", "physicality",
+    "physical",
+}
+OTHER_LABELS = {
+    "overall rating", "overall", "weak foot", "skill moves", "position",
+    "rarity", "playstyle", "playstyle+", "roles", "role",
+}
+
+
+def group_upgrades(items: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Splits totalUpgradesText into (Face stats, Ingame stats, Others),
+    dropping any group that ends up empty. An unrecognised label is treated
+    as an in-game stat, which is where the long tail of attributes lives."""
+    face, ingame, other = [], [], []
+    for it in items:
+        label = str(it.get("label", "")).strip().lower()
+        if label in FACE_STAT_LABELS:
+            face.append(it)
+        elif any(label.startswith(o) for o in OTHER_LABELS):
+            other.append(it)
+        else:
+            ingame.append(it)
+    return [g for g in (("Face stats", face), ("Ingame stats", ingame),
+                        ("Others", other)) if g[1]]
+
+
 def build_evolution_card(item: dict, render_page) -> tuple[dict, bytes, str]:
-    """Builds the rendered PNG card plus a minimal Discord embed (title/url/
-    color/image-attachment) for a new Evolution. render_page is an
-    already-open Playwright page (see cards.render_card) reused across a
-    run's cards rather than opening a new browser per item."""
+    """Builds the rendered PNG card plus a minimal Discord embed for a new
+    Evolution.
+
+    Same two-panel shape as the SBC and Objective cards: what it costs and
+    asks of you on the left, what you get on the right. No player artwork
+    -- fut.gg's card image shows the player BEFORE the evolution, so
+    printing it beside the evolved stats invites the reader to trust the
+    wrong numbers."""
     evo = item["evolution"]
     base = item.get("basePlayer") or {}
     upgraded = item.get("upgradedPlayer") or {}
-
     game_label = cards.detect_game_label(
         upgraded.get("cardImageUrl"), base.get("cardImageUrl")
     )
 
-    price_bits = []
+    # Coins and FC Points are ALTERNATIVE ways to pay for an evolution, not
+    # a combined price -- joining them with "+" overstated the cost.
+    options = []
     if evo.get("coinsCost"):
-        price_bits.append(f"{evo['coinsCost']:,} coins")
+        options.append(("Coins", f"{evo['coinsCost']:,}"))
     if evo.get("pointsCost"):
-        price_bits.append(f"{evo['pointsCost']:,} points")
+        options.append(("FC Points", f"{evo['pointsCost']:,}"))
     if evo.get("tokenCost"):
-        price_bits.append(f"{evo['tokenCost']:,} tokens")
-    price_text = " + ".join(price_bits) if price_bits else "Free"
+        options.append(("Tokens", f"{evo['tokenCost']:,}"))
 
-    req_items = (evo.get("requirementsText") or [])[:3]
-    upg_items = (evo.get("totalUpgradesText") or [])[:3]
-    req_rows = "".join(
-        cards.row("🔒", r.get("label", ""), format_kv_value(r), True) for r in req_items
-    ) or cards.row("✅", "No restrictions", "Open to eligible players")
-    upg_rows = "".join(
-        cards.row("⬆️", r.get("label", ""), format_kv_value(r)) for r in upg_items
-    ) or cards.row("—", "No upgrade data", "")
+    if options:
+        left_rows = cards.alternatives_row("Cost", options)
+    else:
+        # No price doesn't mean free -- an evo with no coin/point cost may
+        # be earned another way. Say how when the payload tells us, and
+        # only claim Free when nothing suggests otherwise.
+        how = cards.extract_acquisition(evo)
+        if how:
+            left_rows = cards.headline_row(
+                "Cost", "Not purchasable", "", truncate(how, 90)
+            )
+        else:
+            left_rows = cards.headline_row("Cost", "Free")
 
-    left_html = f"""<div class="panel">
-      <div class="panel-head"><span>Entry Requirements</span><span class="count">{len(evo.get('requirementsText') or [])} conditions</span></div>
-      <div class="panel-body" style="flex:0.5;">{req_rows}</div>
-      <div class="subhead">Upgrades Applied</div>
-      <div class="panel-body" style="flex:0.5; padding-top:0;">{upg_rows}</div>
-    </div>"""
+    unlock = relative_days(evo.get("endTime")).replace("in ", "")
+    submit = relative_days(evo.get("endSubmissionTime")).replace("in ", "")
+    left_rows += cards.meta_tiles([
+        ("Unlock within", "" if unlock.lower() == "unknown" else unlock),
+        ("Expires in", "" if submit.lower() == "unknown" else submit),
+        ("Repeatable",
+         "" if evo.get("isRepeatable") is None
+         else ("Yes" if evo.get("isRepeatable") else "No")),
+    ])
 
-    base_img = base.get("cardImageUrl")
-    upg_img = upgraded.get("cardImageUrl")
-    base_html = (
-        f'<div class="card-photo mini" style="background-image:url(\'{base_img}\')"></div>'
-        if base_img else '<div class="card-photo mini"></div>'
+    # Who is ELIGIBLE to use the evolution.
+    reqs = evo.get("requirementsText") or []
+    if reqs:
+        req_rows = ""
+        for r in reqs:
+            req_rows += cards.compact_row(
+                "", truncate(str(r.get("label", "")), 26), format_kv_value(r)
+            )
+        left_rows += '<div class="subhead">Requirements</div>' + cards.two_col(req_rows)
+
+    # What you actually play to complete it -- separate from eligibility,
+    # and missing from the card entirely before.
+    challenges = cards.extract_evo_challenges(evo)
+    if challenges:
+        left_rows += '<div class="subhead">How to Unlock</div>'
+        for i, c in enumerate(challenges, 1):
+            c_title, c_detail = task_label(c) if isinstance(c, dict) else (str(c), "")
+            if c_title:
+                left_rows += cards.compact_row(
+                    str(i), truncate(c_title, 30), truncate(c_detail, 24)
+                )
+
+    # One plain list, no group headings -- the labels say what each stat is
+    # and the headings were spending three lines to add nothing. Face stats
+    # still lead, since group_upgrades() returns them first.
+    upgrades = ""
+    for _name, items in group_upgrades(evo.get("totalUpgradesText") or []):
+        for r in items:
+            upgrades += cards.compact_row(
+                "",
+                truncate(str(r.get("label", "")), 22),
+                str(r.get("value", "")),
+                str(r.get("maxValue") or ""),
+            )
+    if upgrades:
+        left_rows += '<div class="subhead">Upgrades Applied</div>' + cards.two_col(upgrades)
+
+    left_html = cards.panel(
+        "Evolution Details",
+        f"{len(evo.get('totalUpgradesText') or [])} upgrades",
+        left_rows,
     )
-    upg_html = (
-        f'<div class="card-photo" style="background-image:url(\'{upg_img}\')"></div>'
-        if upg_img else '<div class="card-photo"></div>'
-    )
-    name_line = (
-        f"{player_name(base)}: {base.get('overall', '?')} → {upgraded.get('overall', '?')} OVR"
-        if base and upgraded else ""
-    )
+
+    enriched = enrich_player(render_page, upgraded)
+    name = player_name(enriched) or player_name(base) or "Evolution"
+    base_ovr, up_ovr = base.get("overall"), enriched.get("overall")
+
+    right_rows = ""
+    if up_ovr is not None:
+        sub = (f"up from {base_ovr}"
+               if base_ovr is not None and base_ovr != up_ovr else "")
+        right_rows += cards.headline_row("Overall", str(up_ovr), "OVR", sub)
+    right_rows += cards.evolved_stat_strip(base, enriched)
+    right_rows += cards.position_versatility_row(enriched)
+
+    # Roles and PlayStyles are both shown against the pre-evolution player,
+    # so what the evo actually GIVES is marked rather than the card just
+    # listing what the finished player happens to have. A PlayStyle has two
+    # tiers and the upgraded one is written with a SINGLE "+"; the double
+    # "++" belongs to Roles, which are a different thing entirely.
+    role_names = cards.extract_roles(enriched)
+    if role_names:
+        base_roles = cards.extract_roles(base)
+        right_rows += '<div class="player-section-label">Roles</div>'
+        right_rows += (
+            '<div class="roles">'
+            f'{cards.role_chips(role_names, base_roles if base_roles else None)}'
+            "</div>"
+        )
+    ps = cards.extract_playstyle_names(enriched)
+    if ps:
+        base_ps = cards.extract_playstyle_names(base)
+        right_rows += '<div class="player-section-label">PlayStyles</div>'
+        right_rows += (
+            '<div class="roles">'
+            f'{cards.playstyle_chips(ps, base_ps if base_ps else None)}'
+            "</div>"
+        )
+
+    positions = cards.extract_positions(enriched)[0] or ""
     right_html = cards.panel(
-        "Evolution", "Base → Upgraded",
-        f"""<div class="reward-panel-body">
-          <div class="evo-pair">{base_html}<div class="arrow">→</div>{upg_html}</div>
-          <div class="card-cap"><div class="t">{name_line}</div><div class="s">{price_text}</div></div>
-        </div>""",
-        centered=True,
+        "Evolved Player",
+        f"{name} · {positions}" if positions else name,
+        f'<div class="panel-stack">{right_rows}</div>',
     )
 
     title = evo.get("name") or "New Evolution"
-    description = (evo.get("description") or "").strip()
     html = cards.frame(
-        game_label, "NEW EVOLUTION", title,
-        truncate(description, 160) or "Unlock and upgrade an eligible player through staged challenges.",
+        game_label, "NEW EVO", title,
+        truncate((evo.get("description") or "").strip(), 200),
         left_html, right_html,
-        "⚡", f"{title} | EVOLUTION",
-        truncate(description, 120) or "New evolution available.",
-        f"⏱ Unlock within {relative_days(evo.get('endTime'))}",
-        f'<div class="chip status">⚠ Submit by {relative_days(evo.get("endSubmissionTime"))}</div>',
     )
     png = cards.render_card(render_page, html)
     file_name = f"evolution_{evo.get('id', 'x')}.png"
@@ -554,6 +739,82 @@ def build_evolution_card(item: dict, render_page) -> tuple[dict, bytes, str]:
     if evo.get("url"):
         embed["url"] = f"{FUTGG_BASE}{evo['url']}"
     return embed, png, file_name
+
+
+_REWARD_NAME_KEYS = ("name", "title", "label", "itemname", "packname", "description")
+_REWARD_COIN_KEYS = ("coins", "coinsamount", "coinamount", "coinvalue")
+_REWARD_COUNT_KEYS = ("count", "quantity", "amount", "numberofitems")
+MAX_REWARD_NOTE_LEN = 80
+
+
+def _reward_string(value) -> str:
+    """A short human string from a payload value, or "" if it isn't one.
+
+    Guards the same way _resolve_icon_slug() does: a value can be a data
+    URI, a serialized blob or a URL, and none of those belong in a header
+    label."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > MAX_REWARD_NOTE_LEN:
+        return ""
+    if any(bad in text for bad in ("://", "data:", "\n", "{", "}", "<")):
+        return ""
+    return text
+
+
+def award_label(award: dict) -> str:
+    """Describes one award, whatever kind of thing it is.
+
+    SBC and objective rewards are not always players -- they're packs,
+    coins, kits, badges, tradeable items. Rather than assume a shape, this
+    reads whichever of those the payload happens to describe, so the
+    header names the actual reward instead of the word "Reward"."""
+    if not isinstance(award, dict):
+        return ""
+
+    player = award.get("player") or award.get("playerItem")
+    if isinstance(player, dict):
+        name = player_name(player)
+        if name:
+            overall = player.get("overall")
+            return f"{name} · {overall} OVR" if overall else name
+
+    count = 0
+    for key, value in award.items():
+        if str(key).lower() in _REWARD_COUNT_KEYS and isinstance(value, int):
+            count = value
+            break
+
+    for key, value in award.items():
+        if str(key).lower() in _REWARD_COIN_KEYS and isinstance(value, int) and value > 0:
+            return f"{value:,} coins"
+
+    # A named item, either directly on the award or on a nested item dict
+    # (fut.gg wraps some rewards a level down).
+    for source in (award, *(v for v in award.values() if isinstance(v, dict))):
+        for key, value in source.items():
+            if str(key).lower() in _REWARD_NAME_KEYS:
+                text = _reward_string(value)
+                if text:
+                    return f"{count}x {text}" if count > 1 else text
+    return ""
+
+
+def reward_note(item: dict) -> str:
+    """The header label naming an item's reward -- a player and rating, a
+    pack, coins. Used by both the SBC and objective cards. Names up to two
+    awards; returns "" when the payload describes none, leaving the
+    panel's own "Reward" heading to stand alone rather than printing it
+    twice."""
+    labels = []
+    for award in item.get("awards") or []:
+        text = award_label(award)
+        if text and text not in labels:
+            labels.append(text)
+        if len(labels) == 2:
+            break
+    return truncate(" + ".join(labels), 46)
 
 
 def sbc_image_url(sbc: dict) -> str | None:
@@ -570,6 +831,14 @@ def sbc_image_url(sbc: dict) -> str | None:
         card_path = player.get("cardImagePath") or player.get("simpleCardImagePath")
         if card_path:
             return f"https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=300/{card_path}"
+
+    # Not a player: the SBC's own tile IS the reward artwork, and it's EA's
+    # real themed art -- the 83+ upgrade shield with its rating printed on
+    # it, the Pre-Season puzzle piece, the FUTTIES pick shield. Do not
+    # substitute a generic pack/pick stand-in for it; that trades a good
+    # image for a worse one. This whole function is deliberately left
+    # exactly as the deployed bot has it, because the live posts prove it
+    # resolves the right picture for every reward type.
     if sbc.get("imageUrl"):
         return sbc["imageUrl"]
     if sbc.get("imagePath"):
@@ -577,55 +846,183 @@ def sbc_image_url(sbc: dict) -> str | None:
     return None
 
 
+def fetch_sbc_challenges(sbc: dict, page) -> list[dict]:
+    """Returns an SBC's individual challenges.
+
+    The old note on build_sbc_card said fut.gg only exposes challengesCount
+    and not the challenges themselves. That is true of the SBC list API,
+    but the SBC's own page does list them by name with their requirements,
+    so this loads that page and reads them the same way objectives are
+    handled -- and accepts the result only when the number found matches
+    challengesCount, so a wrong list can't be shown as if it were right.
+
+    Any failure returns [] and the card falls back to the count alone."""
+    if os.environ.get("SKIP_SBC_CHALLENGES", "").lower() == "true":
+        return []
+    inline = extract_objective_tasks(sbc, sbc.get("challengesCount"))
+    if inline:
+        return inline
+    url = sbc.get("url")
+    if not url:
+        return []
+    url = url if url.startswith("http") else f"{FUTGG_BASE}{url}"
+    if url in _PLAYER_DETAIL_CACHE:
+        payload = _PLAYER_DETAIL_CACHE[url]
+    else:
+        payload = {}
+        try:
+            goto_and_wait_for_router(
+                _detail_page(page),
+                url,
+                """
+                () => {
+                    const m = window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state.matches;
+                    return !!(m && m.some(x => x.loaderData));
+                }
+                """,
+            )
+            payload = _detail_page(page).evaluate(
+                """
+                () => {
+                    const matches = window.__TSR_ROUTER__.state.matches.filter(m => m.loaderData);
+                    return Object.assign({}, ...matches.map(m => m.loaderData));
+                }
+                """
+            ) or {}
+        except Exception as e:
+            print(f"  ! couldn't load SBC challenges from {url}: {e}")
+        _PLAYER_DETAIL_CACHE[url] = payload
+    found = extract_objective_tasks(payload, sbc.get("challengesCount"))
+    if not found and payload:
+        print(f"  ! no challenge list matching challengesCount="
+              f"{sbc.get('challengesCount')} on {url}")
+    return found
+
+
 def build_sbc_card(sbc: dict, render_page) -> tuple[dict, bytes, str]:
     """Builds the rendered PNG card plus a minimal Discord embed for a new
-    SBC. NOTE: fut.gg's SBC API (see SBC_API / fetch_sbcs()) only gives us
-    challengesCount, not each individual challenge's own requirement text
-    the way evolutions expose requirementsText -- so unlike the Evolution
-    card, this one can't show a real per-challenge breakdown. It shows what
-    the API actually gives us (cost, challenge count, expiry, description).
-    If fut.gg's SBC payload turns out to carry per-challenge requirements
-    under a different key, extending this to a real per-row breakdown is a
-    small follow-up, not a redesign."""
-    cost_bits = []
+    SBC. The SBC list payload only carries challengesCount, so the named
+    challenge breakdown is read off the SBC's own page by
+    fetch_sbc_challenges() and validated against that count; if it can't be
+    confirmed the panel falls back to the cost and timing rows alone."""
+    # Console and PC prices on one line, fut.gg style. When they match (or
+    # only one side is priced) it collapses to a single "N coins" rather
+    # than printing the same number twice under two different labels.
+    # Console and PC each get their own labelled half of the cost block --
+    # they price differently and the reader needs to know which figure is
+    # theirs. price_split_row() collapses them back to one when the two
+    # amounts are equal, and only one platform is listed when only one is
+    # priced (rather than implying the other is free).
+    prices = []
     if sbc.get("cost"):
-        cost_bits.append(f"{sbc['cost']:,} coins")
-    if sbc.get("costPc") and sbc.get("costPc") != sbc.get("cost"):
-        cost_bits.append(f"{sbc['costPc']:,} coins (PC)")
-    cost_text = " / ".join(cost_bits) if cost_bits else "Unknown"
+        prices.append(("Console", sbc["cost"]))
+    if sbc.get("costPc"):
+        prices.append(("PC", sbc["costPc"]))
 
     image_url = sbc_image_url(sbc)
     game_label = cards.detect_game_label(image_url)
 
-    reward_label = "Reward"
+    # The panel header names whatever the reward actually is -- a player
+    # and rating, a pack, coins -- rather than the word "Reward", which is
+    # already the heading beside it.
+    reward_label = ""
+    reward_caption = ""
+    reward_player = None
     for award in sbc.get("awards") or []:
         player = award.get("player")
         if player:
+            reward_player = player
             nm = player_name(player)
             if nm:
                 reward_label = f"{nm} · {player.get('overall', '?')} OVR"
             break
+    if not reward_player:
+        # A non-player reward shares the header with the heading in a
+        # narrowed column, so a short name goes up there and a long one
+        # goes under the art, where it has the full width to wrap into.
+        note = reward_note(sbc)
+        if len(note) <= 24:
+            reward_label = note
+        else:
+            reward_caption = note
 
     description = (sbc.get("description") or "").strip()
-    left_rows = cards.row("🪙", "Estimated Cost", cost_text, True)
-    left_rows += cards.row("🧩", "Challenges", str(sbc.get("challengesCount", "?")))
-    left_rows += cards.row("⏱", "Expires", relative_days(sbc.get("endTime")), True)
-    if description:
-        left_rows += cards.row("📋", "Details", truncate(description, 180))
+    # The description is already the card's subtitle and the challenge
+    # count is already in the panel header -- neither is repeated here.
+    # Cost leads, because that's what people scan an SBC post for; expiry
+    # and repeatability pair off beneath it as small facts.
+    left_rows = cards.price_split_row("Estimated Cost", prices)
+    expires = relative_days(sbc.get("endTime")).replace("in ", "")
+    left_rows += cards.meta_tiles([
+        # A tile reading "unknown" is worse than no tile: drop it and let
+        # the remaining one take the width.
+        ("Expires", "" if expires.lower() == "unknown" else expires),
+        ("Repeatable",
+         "" if sbc.get("isRepeatable") is None
+         else ("Yes" if sbc.get("isRepeatable") else "No")),
+    ])
+
+    # The squads you actually have to build -- the most useful thing on an
+    # SBC and what was leaving this panel half empty. Listed by name when
+    # they can be read off the SBC's own page (see fetch_sbc_challenges),
+    # otherwise the panel just shows the cost and timing above.
+    steps = []
+    for c in fetch_sbc_challenges(sbc, render_page):
+        c_title, _ = task_label(c)
+        if c_title:
+            # Show four, then say how many are left rather than dropping
+            # them silently -- a squad can carry six and the reader needs
+            # to know the list isn't the whole story.
+            all_reqs = [truncate(r, 30) for r in task_requirements(c)]
+            reqs = all_reqs[:4]
+            if len(all_reqs) > 4:
+                reqs.append(f"+{len(all_reqs) - 4} more")
+            steps.append((truncate(c_title, 30), reqs))
+    if steps:
+        left_rows += '<div class="subhead">Challenges</div>'
+        left_rows += cards.challenge_ladder(steps)
     left_html = cards.panel(
         "SBC Details", f"{sbc.get('challengesCount', '?')} challenges", left_rows
     )
 
-    reward_html = (
-        f'<div class="card-photo" style="background-image:url(\'{image_url}\')"></div>'
-        if image_url else '<div class="pack"><div class="glyph">🎁</div></div>'
-    )
+    # The reward panel follows the reward. A player gets the card-shaped
+    # hero frame and the player detail beneath it; a pack, a player pick,
+    # a set graphic or anything else keeps its own aspect ratio at the
+    # width of the (narrowed) column -- these come in several shapes and
+    # forcing any of them into a portrait card frame left them shrunk and
+    # floating in an empty panel.
+    if reward_player and image_url:
+        reward_html = (
+            f'<div class="card-photo hero" '
+            f'style="background-image:url(\'{image_url}\')"></div>'
+        )
+    elif image_url:
+        reward_html = cards.reward_art(image_url)
+    else:
+        reward_html = '<div class="pack"><div class="glyph">🎁</div></div>'
+    if reward_caption:
+        reward_html += f'<div class="card-cap"><div class="t">{reward_caption}</div></div>'
+    # Whether the reward can be sold on -- EA prints it on the item and it
+    # changes what the reward is worth. Omitted when the payload doesn't
+    # say, rather than guessed.
+    reward_html += cards.trade_badge(reward_tradeability(sbc))
+
     title = sbc.get("name") or "New SBC"
+    # No caption and no stat row under the card: the panel header already
+    # carries the player's name and rating, and the card art prints its own
+    # face stats. Positions, roles and PlayStyles are kept, since the card
+    # can't show those legibly at this size. Each section returns "" when
+    # the payload has nothing for it, so none of them leaves a stray
+    # heading behind -- which is also what makes them safe to render for a
+    # non-player reward, where they all come back empty.
+    enriched = enrich_player(render_page, reward_player)
     right_html = cards.panel(
         "Reward", reward_label,
-        f"""<div class="reward-panel-body">
+        f"""<div class="reward-panel-body{'' if reward_player else ' mid'}">
           {reward_html}
-          <div class="card-cap"><div class="t">{title}</div><div class="s">{reward_label}</div></div>
+          {cards.position_versatility_row(enriched)}
+          {cards.role_familiarity_row(enriched)}
+          {cards.playstyle_badges(cards.extract_playstyle_names(enriched))}
         </div>""",
         centered=True,
     )
@@ -634,10 +1031,9 @@ def build_sbc_card(sbc: dict, render_page) -> tuple[dict, bytes, str]:
         game_label, "NEW SBC", title,
         truncate(description, 160) or "Complete this squad building challenge to earn the reward.",
         left_html, right_html,
-        "🛡️", f"{title} | SBC",
-        truncate(description, 120) or "New squad building challenge available.",
-        f"⏱ Expires {relative_days(sbc.get('endTime'))}",
-        f'<div class="chip">🧩 {sbc.get("challengesCount", "?")} challenges</div>',
+        # A pack doesn't earn half the card's width; give the challenges
+        # the room instead.
+        compact_reward=not reward_player,
     )
     png = cards.render_card(render_page, html)
     file_name = f"sbc_{sbc.get('id', 'x')}.png"
@@ -650,6 +1046,389 @@ def build_sbc_card(sbc: dict, render_page) -> tuple[dict, bytes, str]:
     if sbc.get("url"):
         embed["url"] = f"{FUTGG_BASE}{sbc['url']}"
     return embed, png, file_name
+
+
+_PLAYER_DETAIL_CACHE: dict[str, dict] = {}
+_DETAIL_PAGE = None
+
+
+def _detail_page(render_page):
+    """A separate tab for loading player pages, opened lazily in the same
+    browser context. Kept apart from the render page on purpose: rendering
+    works by set_content() on a blank page, and navigating that same page
+    out to fut.gg between cards invites timeouts and origin surprises for
+    no benefit."""
+    global _DETAIL_PAGE
+    if _DETAIL_PAGE is None or _DETAIL_PAGE.is_closed():
+        _DETAIL_PAGE = render_page.context.new_page()
+    return _DETAIL_PAGE
+
+
+def player_detail_url(player: dict) -> str | None:
+    """Builds the fut.gg player page URL for a reward player, if the payload
+    carries enough to address one. Accepts either an explicit url/slug or an
+    id we can hit the canonical /players/<id>/ route with (fut.gg redirects
+    that to the full slug URL)."""
+    if not player:
+        return None
+    url = player.get("url") or player.get("playerUrl")
+    if url:
+        return url if url.startswith("http") else f"{FUTGG_BASE}{url}"
+    slug = player.get("slug")
+    if slug:
+        return f"{FUTGG_BASE}/players/{slug}/"
+    for key in ("eaId", "resourceId", "definitionId", "id"):
+        if player.get(key):
+            return f"{FUTGG_BASE}/players/{player[key]}/"
+    return None
+
+
+def fetch_player_details(page, player: dict) -> dict:
+    """Loads a reward player's own fut.gg page and returns its router
+    loaderData, which carries the full player record (PlayStyles, stats,
+    positions) that the SBC/objective/evolution list payloads may only
+    summarise.
+
+    Uses the same window.__TSR_ROUTER__ technique fetch_evolutions() already
+    relies on, so it inherits the same behaviour on fut.gg's ad-script-heavy
+    pages. Results are cached per URL for the run (the same player can be the
+    reward for more than one item), and ANY failure returns {} -- a card
+    still renders from whatever the list payload had, it just shows less.
+    Set SKIP_PLAYER_DETAIL=true to turn these extra page loads off."""
+    if os.environ.get("SKIP_PLAYER_DETAIL", "").lower() == "true":
+        return {}
+    url = player_detail_url(player)
+    if not url:
+        return {}
+    if url in _PLAYER_DETAIL_CACHE:
+        return _PLAYER_DETAIL_CACHE[url]
+    detail = {}
+    try:
+        goto_and_wait_for_router(
+            _detail_page(page),
+            url,
+            """
+            () => {
+                const m = window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state.matches;
+                return !!(m && m.some(x => x.loaderData));
+            }
+            """,
+        )
+        detail = _detail_page(page).evaluate(
+            """
+            () => {
+                const matches = window.__TSR_ROUTER__.state.matches.filter(m => m.loaderData);
+                // Merge every match's loaderData -- which one holds the
+                // player record has moved between fut.gg releases.
+                return Object.assign({}, ...matches.map(m => m.loaderData));
+            }
+            """
+        ) or {}
+    except Exception as e:
+        print(f"  ! couldn't load player detail from {url}: {e}")
+    _PLAYER_DETAIL_CACHE[url] = detail
+    return detail
+
+
+def enrich_player(page, player: dict) -> dict:
+    """Returns the reward player merged with anything extra its own fut.gg
+    page provides. The list payload always wins on keys it already has, so
+    this can only add detail, never overwrite what we were given."""
+    if not player:
+        return player or {}
+    if cards.extract_playstyle_names(player):
+        return player          # list payload already had them; no page load
+    try:
+        detail = fetch_player_details(page, player)
+    except Exception as e:
+        # Enrichment is strictly a bonus: never let it stop a post going
+        # out. Worst case the card renders from the list payload alone.
+        print(f"  ! player detail lookup failed, posting without it: {e}")
+        return player
+    if not detail:
+        return player
+    merged = dict(detail)
+    merged.update(player)
+    return merged
+
+
+def _candidate_task_lists(node, out: list):
+    """Collects every list in a payload that looks like a list of tasks:
+    dicts carrying a short name/title/description string."""
+    if isinstance(node, dict):
+        for value in node.values():
+            _candidate_task_lists(value, out)
+    elif isinstance(node, list):
+        entries = [e for e in node if isinstance(e, dict)]
+        if entries and len(entries) == len(node):
+            named = [
+                e for e in entries
+                if any(isinstance(e.get(k), str) and e.get(k).strip()
+                       for k in ("name", "title", "description", "text"))
+            ]
+            if len(named) == len(entries):
+                out.append(entries)
+        for entry in node:
+            _candidate_task_lists(entry, out)
+
+
+def extract_objective_tasks(payload: dict, expected_count: int | None) -> list[dict]:
+    """Pulls an objective's individual tasks out of its page payload.
+
+    fut.gg's field names aren't something this can rely on, so instead of
+    guessing a key it gathers every task-shaped list and picks the one whose
+    length matches the objective's own tasksCount. That count comes from a
+    different source (the list payload we already had), so agreeing with it
+    is real corroboration rather than a guess -- and when nothing matches
+    it returns [] and the card falls back to showing the count alone."""
+    if not payload:
+        return []
+    candidates: list = []
+    _candidate_task_lists(payload, candidates)
+    if not candidates:
+        return []
+    if expected_count:
+        exact = [c for c in candidates if len(c) == expected_count]
+        if exact:
+            # Prefer the most detailed of the matching lists.
+            return max(exact, key=lambda c: sum(len(e) for e in c))
+        return []
+    return max(candidates, key=len)
+
+
+_DETAIL_KEY_HINTS = (
+    "requirement", "description", "text", "condition", "detail", "subtitle",
+)
+
+
+def _detail_text(value) -> str:
+    """Flattens whatever a detail field holds into one short line.
+
+    fut.gg is inconsistent about this: an objective task's requirement is a
+    plain string, while an evolution's requirementsText is a list of
+    {label, value} pairs. Rather than guess which shape a given payload
+    uses, accept both -- and anything nested one level deeper -- so a
+    change on their side doesn't silently blank the column."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        label = str(value.get("label") or value.get("name") or "").strip()
+        val = str(value.get("value") or value.get("text") or "").strip()
+        return f"{label} {val}".strip()
+    if isinstance(value, list):
+        parts = [p for p in (_detail_text(v) for v in value) if p]
+        return ", ".join(parts)
+    return ""
+
+
+def task_label(task: dict) -> tuple[str, str]:
+    """Returns (title, detail) for one task row.
+
+    The detail side matches on what the key *means* rather than on an exact
+    field name, for the same reason extract_playstyle_names() does: these
+    rows have to keep working when fut.gg renames a field."""
+    title = ""
+    for key in ("name", "title"):
+        if isinstance(task.get(key), str) and task[key].strip():
+            title = task[key].strip()
+            break
+    detail = ""
+    for key, value in task.items():
+        if not any(hint in str(key).lower() for hint in _DETAIL_KEY_HINTS):
+            continue
+        candidate = _detail_text(value)
+        if candidate and candidate != title:
+            detail = candidate
+            break
+    if not title:
+        title, detail = detail, ""
+    return title, detail
+
+
+def _detail_parts(value) -> list[str]:
+    """Like _detail_text(), but keeps each requirement separate.
+
+    A real SBC challenge carries several ("MIN overall 77", "MAX 4
+    leagues", "MIN 22 total chem"), and joining them into one string meant
+    the tail was cut off by the row's length limit. Kept as a list, each
+    one gets its own chip and nothing is silently lost."""
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, dict):
+        text = _detail_text(value)
+        return [text] if text else []
+    if isinstance(value, list):
+        parts = []
+        for entry in value:
+            parts.extend(_detail_parts(entry))
+        return parts
+    return []
+
+
+# fut.gg writes requirements out in full ("Min. Squad Total Chemistry
+# Points: 22"); EA's own tiles abbreviate ("MIN 22 total chem"). These
+# rewrites follow EA's shorthand so a six-requirement challenge fits on
+# the card. Anything that matches no pattern is left exactly as written
+# rather than mangled -- worst case it reads like fut.gg.
+_REQUIREMENT_SHORTHAND = (
+    (re.compile(r"^(Min|Max)\.?\s*Squad Total Chemistry Points:\s*(\d+)$", re.I), r"\1. Chem \2"),
+    (re.compile(r"^(Min|Max)\.?\s*Team Rating:\s*(\d+)$", re.I), r"\1. Rating \2"),
+    (re.compile(r"^(Min|Max)\.?\s*(Clubs|Leagues|Nations|Players) in Squad:\s*(\d+)$", re.I), r"\1. \3 \2"),
+    (re.compile(r"^(Min|Max)\.?\s*(\d+)\s*Players? from the same (\w+)$", re.I), r"\1. \2 per \3"),
+    (re.compile(r"^(Min|Max)\.?\s*(\d+)\s*Players? from:\s*(.+)$", re.I), r"\1. \2 \3"),
+    (re.compile(r"^(Min|Max)\.?\s*(\d+)\s*Players?:\s*(.+)$", re.I), r"\1. \2 \3"),
+)
+
+
+def shorten_requirement(text: str) -> str:
+    """One requirement in EA's shorthand, or unchanged if it fits no
+    known pattern."""
+    text = " ".join((text or "").split())
+    for pattern, replacement in _REQUIREMENT_SHORTHAND:
+        if pattern.match(text):
+            return pattern.sub(replacement, text)
+    return text
+
+
+def task_requirements(task: dict) -> list[str]:
+    """Every requirement on one challenge or task, each on its own.
+
+    Same means-not-name key matching as task_label(); this is the list
+    form, for the SBC challenge ladder."""
+    title, _ = task_label(task)
+    for key, value in task.items():
+        if not any(hint in str(key).lower() for hint in _DETAIL_KEY_HINTS):
+            continue
+        parts = [shorten_requirement(p) for p in _detail_parts(value) if p and p != title]
+        if parts:
+            return parts
+    return []
+
+
+_XP_KEY_HINTS = ("xp", "experience")
+
+
+def task_reward(task: dict) -> str:
+    """What one objective task pays out -- "500 XP", a named pack, or "".
+
+    Same means-not-name matching used elsewhere. XP is checked first
+    because it's the common case and it's a number rather than a name;
+    anything else falls back to award_label(), so a task paying a pack is
+    described the same way an SBC reward is."""
+    if not isinstance(task, dict):
+        return ""
+    for key, value in task.items():
+        k = str(key).lower()
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if any(h == k or k.endswith(h) or k.startswith(h) for h in _XP_KEY_HINTS):
+            return f"{value:,} XP"
+    for key, value in task.items():
+        if "reward" in str(key).lower() or "award" in str(key).lower():
+            if isinstance(value, dict):
+                text = award_label(value)
+                if text:
+                    return text
+            elif isinstance(value, list):
+                for entry in value:
+                    text = award_label(entry) if isinstance(entry, dict) else ""
+                    if text:
+                        return text
+            else:
+                text = _reward_string(value)
+                if text:
+                    return text
+    return ""
+
+
+_TRADEABLE_KEY_HINTS = ("tradeable", "tradable")
+
+
+def reward_tradeability(sbc: dict) -> str:
+    """"Tradeable" / "Untradeable" / "" for an SBC's reward.
+
+    EA prints this on the reward itself and it changes what the reward is
+    worth, so it belongs on the card. The key can be phrased either way
+    round (isTradeable / isUntradeable), so the sense is read off the key
+    name rather than assumed, and anything unrecognised returns "" instead
+    of guessing."""
+    def look(node, depth=0):
+        if depth > 3 or not isinstance(node, dict):
+            return ""
+        for key, value in node.items():
+            k = str(key).lower()
+            if isinstance(value, bool) and any(h in k for h in _TRADEABLE_KEY_HINTS):
+                negated = "untradeable" in k or "untradable" in k or k.startswith("not")
+                tradeable = (not value) if negated else value
+                return "Tradeable" if tradeable else "Untradeable"
+        for value in node.values():
+            if isinstance(value, dict):
+                found = look(value, depth + 1)
+                if found:
+                    return found
+            elif isinstance(value, list):
+                for entry in value:
+                    found = look(entry, depth + 1)
+                    if found:
+                        return found
+        return ""
+
+    return look(sbc)
+
+
+def fetch_objective_tasks(page, obj: dict) -> list[dict]:
+    """Returns an objective's individual tasks.
+
+    Checks the objective we already have first: fetch_objectives() returns
+    whatever fut.gg puts in loaderData.allObjectives, and if the tasks are
+    nested in there (tasksCount has to be counting something) no extra work
+    is needed. Only when they aren't does this load the objective's own
+    page, using the same window.__TSR_ROUTER__ approach fetch_objectives()
+    itself uses.
+
+    Cached per run; any failure returns [] so the card still posts with the
+    task count alone. Set SKIP_OBJECTIVE_TASKS=true to skip the page loads
+    entirely and rely only on the data already in hand."""
+    inline = extract_objective_tasks(obj, obj.get("tasksCount"))
+    if inline:
+        return inline
+    if os.environ.get("SKIP_OBJECTIVE_TASKS", "").lower() == "true":
+        return []
+    slug = obj.get("slug")
+    if not slug:
+        return []
+    url = f"{FUTGG_BASE}/objectives/{slug}/"
+    if url in _PLAYER_DETAIL_CACHE:
+        payload = _PLAYER_DETAIL_CACHE[url]
+    else:
+        payload = {}
+        try:
+            goto_and_wait_for_router(
+                _detail_page(page),
+                url,
+                """
+                () => {
+                    const m = window.__TSR_ROUTER__ && window.__TSR_ROUTER__.state.matches;
+                    return !!(m && m.some(x => x.loaderData));
+                }
+                """,
+            )
+            payload = _detail_page(page).evaluate(
+                """
+                () => {
+                    const matches = window.__TSR_ROUTER__.state.matches.filter(m => m.loaderData);
+                    return Object.assign({}, ...matches.map(m => m.loaderData));
+                }
+                """
+            ) or {}
+        except Exception as e:
+            print(f"  ! couldn't load objective tasks from {url}: {e}")
+        _PLAYER_DETAIL_CACHE[url] = payload
+    tasks = extract_objective_tasks(payload, obj.get("tasksCount"))
+    if not tasks and payload:
+        print(f"  ! no task list matching tasksCount={obj.get('tasksCount')} on {url}")
+    return tasks
 
 
 def objective_image_url(obj: dict) -> str | None:
@@ -669,9 +1448,17 @@ def objective_image_url(obj: dict) -> str | None:
 
 def build_objective_card(obj: dict, render_page) -> tuple[dict, bytes, str]:
     """Builds the rendered PNG card plus a minimal Discord embed for a new
-    Objective. Same caveat as build_sbc_card(): fut.gg gives us tasksCount,
-    not each task's own text, so the task list shows what's actually
-    available rather than a fabricated per-task breakdown."""
+    Objective.
+
+    The objective's individual tasks are listed when they can be read off
+    its own fut.gg page (see fetch_objective_tasks); otherwise the card
+    falls back to the category and expiry alone. The reward column is
+    narrowed unless the reward is an actual player card -- a pack image
+    doesn't earn half the card's width.
+
+    Structured like the SBC card, for the same reasons: the fact that
+    drives the decision leads, the small facts pair off beneath it, and
+    the list of things to do is a numbered ladder."""
     category = (obj.get("category") or {}).get("name", "Objective")
     awards = obj.get("awards") or []
     first = awards[0] if awards else {}
@@ -680,27 +1467,88 @@ def build_objective_card(obj: dict, render_page) -> tuple[dict, bytes, str]:
     game_label = cards.detect_game_label(reward_card_url)
 
     description = (obj.get("description") or "").strip()
-    left_rows = cards.row("🏷️", "Category", category, True)
-    left_rows += cards.row("☑️", "Tasks", str(obj.get("tasksCount", "?")))
-    left_rows += cards.row("⏱", "Expires", relative_days(obj.get("endTime")), True)
-    if description:
-        left_rows += cards.row("📋", "Details", truncate(description, 180))
-    left_html = cards.panel("Objective Details", category, left_rows)
+    tasks = fetch_objective_tasks(render_page, obj)
 
+    # An objective has no price, so the clock is the thing people act on:
+    # it leads, the way cost leads on an SBC.
+    # The category rides under the clock rather than sitting in a tile of
+    # its own, because the tile beside it ("Tasks: 6") only repeated the
+    # count the panel header already carries.
+    expires = relative_days(obj.get("endTime")).replace("in ", "")
+    left_rows = cards.headline_row(
+        "Time Left",
+        "No deadline given" if expires.lower() == "unknown" else expires,
+        "", category,
+    )
+
+    steps = []
+    for task in tasks:
+        t_title, t_detail = task_label(task)
+        if not t_title:
+            continue
+        steps.append((
+            truncate(t_title, 34),
+            truncate(t_detail, 64),
+            truncate(task_reward(task), 18),
+        ))
+    if steps:
+        left_rows += '<div class="subhead">Tasks</div>'
+        left_rows += cards.task_ladder(steps)
+    # When the tasks can't be read, the panel stops at the clock. The
+    # description is already the card's subtitle, so repeating it here as
+    # an "About" row would only pad the panel with something the reader
+    # has just read.
+
+    left_html = cards.panel(
+        "Objective Details",
+        f"{len(steps) or obj.get('tasksCount', '?')} tasks",
+        left_rows,
+    )
+
+    # Same reward treatment as the SBC card: a player gets the hero card
+    # frame, anything else keeps its own aspect ratio in the narrowed
+    # column, and a failed image load falls back rather than posting a
+    # broken-image icon.
     image_url = objective_image_url(obj)
     if reward_card_url:
-        reward_html = f'<div class="card-photo" style="background-image:url(\'{reward_card_url}\')"></div>'
+        reward_html = (
+            f'<div class="card-photo hero" '
+            f'style="background-image:url(\'{reward_card_url}\')"></div>'
+        )
     elif image_url:
-        reward_html = f'<div class="pack" style="background-image:url(\'{image_url}\')"></div>'
+        reward_html = cards.reward_art(image_url)
     else:
         reward_html = '<div class="pack"><div class="glyph">🎁</div></div>'
 
+    # The reward's real name and tradeability, not the hardcoded word
+    # "Untradeable" this used to print on every objective whether or not
+    # it was true. A long name goes under the art, where it can wrap.
+    # A player reward keeps the full-width column, so its name goes in the
+    # header however long it is -- the same place the SBC card puts it.
+    # Only a non-player reward, whose column is narrowed, has to fall back
+    # to a caption when the name won't share that header with the heading.
+    reward_label, reward_caption = "", ""
+    note = reward_note(obj)
+    if note:
+        if reward_card_url or len(note) <= 24:
+            reward_label = note
+        else:
+            reward_caption = note
+    if reward_caption:
+        reward_html += f'<div class="card-cap"><div class="t">{reward_caption}</div></div>'
+    reward_html += cards.trade_badge(reward_tradeability(obj))
+
     title = obj.get("name") or "New Objective"
+    # No caption repeating the objective's own title (it's the card's
+    # heading already) and no stat row repeating what the card art prints.
+    enriched = enrich_player(render_page, player_item)
     right_html = cards.panel(
-        "Reward", "Untradeable",
-        f"""<div class="reward-panel-body">
+        "Reward", reward_label,
+        f"""<div class="reward-panel-body{'' if reward_card_url else ' mid'}">
           {reward_html}
-          <div class="card-cap"><div class="t">{title}</div><div class="s">{category}</div></div>
+          {cards.position_versatility_row(enriched)}
+          {cards.role_familiarity_row(enriched)}
+          {cards.playstyle_badges(cards.extract_playstyle_names(enriched))}
         </div>""",
         centered=True,
     )
@@ -709,10 +1557,7 @@ def build_objective_card(obj: dict, render_page) -> tuple[dict, bytes, str]:
         game_label, "NEW OBJECTIVE", title,
         truncate(description, 160) or f"{category} objective — complete all tasks before it expires.",
         left_html, right_html,
-        "🎯", f"{title} | OBJECTIVE",
-        truncate(description, 120) or "New objective available.",
-        f"⏱ Expires {relative_days(obj.get('endTime'))}",
-        f'<div class="chip status">☐ TASKS 0/{obj.get("tasksCount", "?")}</div>',
+        compact_reward=not reward_card_url,
     )
     png = cards.render_card(render_page, html)
     file_name = f"objective_{obj.get('id', 'x')}.png"
@@ -817,16 +1662,35 @@ def process_category(
     they're retried on the next run). `build_fn(item)` returns
     (embed, png_bytes, file_name) -- see build_sbc_card / build_evolution_card
     / build_objective_card -- and the rendered PNG is attached to the post
-    alongside the (minimal) embed."""
+    alongside the (minimal) embed.
+
+    The role ping goes on the FIRST post of a run only. A refresh that
+    finds six new SBCs is one event, and pinging the role six times for it
+    is what makes people mute the channel; the cards after the first carry
+    no content line at all, so the run reads as one announcement followed
+    by its cards.
+
+    BACKFILL_COUNT=N overrides the diff for one run and posts the newest N
+    items whether or not they've been posted before. It exists to
+    republish existing content after a card redesign, so it deliberately
+    does NOT change what counts as seen -- normal runs afterwards behave
+    as though the backfill never happened."""
+    backfill = backfill_count()
     first_run = not seen_ids
     all_ids = {get_id(item) for item in items}
-    new_items = [] if first_run else [i for i in items if get_id(i) not in seen_ids]
 
-    if first_run:
-        print(f"First run for {label}: seeding {len(items)} item(s) without posting.")
+    if backfill:
+        new_items = items[:backfill]
+        print(f"BACKFILL: reposting {len(new_items)} of {len(items)} {label} "
+              f"in payload order, ignoring seen state.")
+    else:
+        new_items = [] if first_run else [i for i in items if get_id(i) not in seen_ids]
+        if first_run:
+            print(f"First run for {label}: seeding {len(items)} item(s) without posting.")
 
     failed_ids = set()
     posted_count = 0
+    announced = False
     for i, item in enumerate(new_items):
         name = get_name(item)
         print(f"Posting new {label[:-1] if label.endswith('s') else label}: {name}")
@@ -836,11 +1700,15 @@ def process_category(
             print(f"  ! failed to render card for '{name}', skipping this run: {e}")
             failed_ids.add(get_id(item))
             continue
+        # Not `i == 0`: if the first item fails to render, the ping has to
+        # ride along with whichever card actually goes out first.
+        content = "" if announced else announce_text
         ok = post_webhook(
-            webhook_url, announce_text, embed, file_bytes=png_bytes, file_name=file_name
+            webhook_url, content, embed, file_bytes=png_bytes, file_name=file_name
         )
         if ok:
             posted_count += 1
+            announced = True
         else:
             failed_ids.add(get_id(item))
             print(f"  will retry '{name}' on the next run")
@@ -848,6 +1716,11 @@ def process_category(
             time.sleep(POST_DELAY_SECONDS)
 
     print(f"{label}: posted {posted_count}/{len(new_items)}.")
+    if backfill:
+        # A backfill republishes what was already announced; letting it
+        # rewrite the seen set would drop anything genuinely new that
+        # happened to fall outside the first N.
+        return seen_ids
     return (seen_ids | all_ids) - failed_ids
 
 
@@ -856,7 +1729,23 @@ def process_category(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    global _AUTO_BACKFILL
     state = load_state()
+
+    # A card redesign republishes a few recent items so the channels show
+    # it straight away. Recorded BEFORE anything is posted, and saved
+    # immediately: if this run dies halfway through, the next one must not
+    # start the backfill over and double-post what already went out. The
+    # cost of that ordering is that a crashed run loses the rest of its
+    # backfill, which is the right way round -- a partial backfill is a
+    # cosmetic loss, a repeated one spams live channels.
+    if state.get("card_design_version", 0) != CARD_DESIGN_VERSION:
+        _AUTO_BACKFILL = BACKFILL_ON_UPDATE
+        print(f"Card design {state.get('card_design_version', 0)} -> "
+              f"{CARD_DESIGN_VERSION}: reposting the newest "
+              f"{BACKFILL_ON_UPDATE} of each category with the new design.")
+        state["card_design_version"] = CARD_DESIGN_VERSION
+        save_state(state)
 
     # Each category is fetched independently and wrapped in its own
     # try/except -- fut.gg's pages occasionally time out (ad/analytics
@@ -909,7 +1798,10 @@ def main() -> int:
     with sync_playwright() as p:
         render_browser = p.chromium.launch()
         render_page = render_browser.new_page(
-            viewport={"width": 1080, "height": 900}, device_scale_factor=2
+            # Short viewport on purpose: every card is captured with
+            # full_page=True, which takes the LARGER of the content and the
+            # viewport, so a tall viewport pads short cards with dead space.
+            viewport={"width": 1080, "height": 300}, device_scale_factor=2
         )
 
         state["evolutions_seen"] = sorted(
