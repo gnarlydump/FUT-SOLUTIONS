@@ -20,6 +20,10 @@ on:
         description: "Force a fresh repost of all currently-expiring evolutions (ignores what's already been notified)"
         type: boolean
         default: false
+      backfill_count:
+        description: "Manually repost the newest N of EACH category (0 = off, max 25). Not needed after a redesign -- that backfills itself on the next run."
+        type: string
+        default: "0"
 
 # If a run is somehow still in progress when the next trigger fires
 # (e.g. the hourly schedule and an external cron-job.org trigger landing
@@ -64,9 +68,15 @@ jobs:
           OBJECTIVES_ROLE_ID: ${{ secrets.OBJECTIVES_ROLE_ID }}
           EXPIRING_ROLE_ID: ${{ secrets.EXPIRING_ROLE_ID }}
           FORCE_EXPIRY_REPOST: ${{ inputs.force_expiry_repost }}
+          BACKFILL_COUNT: ${{ inputs.backfill_count }}
         run: python bot.py
 
+      # always(): if the bot dies partway through, the state it already
+      # wrote (in particular the card-design marker that makes a backfill
+      # one-shot) still has to be committed, or the next run repeats work
+      # that was already posted.
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "futgg-bot"
           git config user.email "actions@users.noreply.github.com"
