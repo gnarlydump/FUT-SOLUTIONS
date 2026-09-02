@@ -326,8 +326,15 @@ def player_name(p: dict) -> str:
     return f"{p.get('firstName', '')} {p.get('lastName', '')}".strip()
 
 
+# Discord caps a single embed field's value at 1024 characters. Anything
+# longer is rejected outright, so a long list has to be split across
+# fields rather than truncated.
+EMBED_FIELD_LIMIT = 1024
+
+
 def format_kv_lines(items: list[dict], limit: int = 12) -> str:
-    """requirementsText / totalUpgradesText are lists of {label, value[, maxValue]}."""
+    """requirementsText / totalUpgradesText are lists of {label, value[,
+    maxValue]}. Kept for the expiry reminder, which wants a short list."""
     lines = []
     for item in items[:limit]:
         label = item.get("label", "")
@@ -340,6 +347,46 @@ def format_kv_lines(items: list[dict], limit: int = 12) -> str:
     if len(items) > limit:
         lines.append(f"...and {len(items) - limit} more")
     return "\n".join(lines) if lines else "None"
+
+
+def kv_fields(name: str, items: list[dict]) -> list[dict]:
+    """The SAME list, as however many embed fields it takes to show all of
+    it -- no "...and 3 more".
+
+    An evolution can apply sixteen upgrades and the old 12-item cap simply
+    dropped the rest, which on a defensive evo meant the tackling stats
+    were the ones that vanished. Lines are packed up to Discord's
+    per-field limit and continued in a second field, so nothing is lost
+    however long the list runs."""
+    lines = []
+    for item in items:
+        label = item.get("label", "")
+        value = item.get("value", "")
+        max_value = item.get("maxValue")
+        lines.append(f"**{label}:** {value} {max_value}" if max_value
+                     else f"**{label}:** {value}")
+    if not lines:
+        return [{"name": name, "value": "None", "inline": False}]
+
+    fields, chunk, size = [], [], 0
+    for line in lines:
+        # +1 for the newline that will join it to the previous line.
+        if chunk and size + len(line) + 1 > EMBED_FIELD_LIMIT:
+            fields.append(chunk)
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        fields.append(chunk)
+
+    return [
+        {
+            "name": name if i == 0 else f"{name} (cont.)",
+            "value": "\n".join(c),
+            "inline": False,
+        }
+        for i, c in enumerate(fields)
+    ]
 
 
 def relative_days(iso_ts: str) -> str:
@@ -414,7 +461,10 @@ def expiring_evolution_embed(item: dict, hours_left: float) -> dict:
         price_bits.append(f"{evo['pointsCost']:,} points")
     if evo.get("tokenCost"):
         price_bits.append(f"{evo['tokenCost']:,} tokens")
-    price_text = " + ".join(price_bits) if price_bits else "Free"
+    # Coins, FC Points and tokens are ALTERNATIVE ways to pay for an
+    # evolution, not a combined bill -- joining them with "+" overstated
+    # the cost.
+    price_text = " or ".join(price_bits) if price_bits else "Free"
 
     name_line = ""
     if base and upgraded:
@@ -511,7 +561,10 @@ def evolution_embed(item: dict) -> dict:
         price_bits.append(f"{evo['pointsCost']:,} points")
     if evo.get("tokenCost"):
         price_bits.append(f"{evo['tokenCost']:,} tokens")
-    price_text = " + ".join(price_bits) if price_bits else "Free"
+    # Coins, FC Points and tokens are ALTERNATIVE ways to pay for an
+    # evolution, not a combined bill -- joining them with "+" overstated
+    # the cost.
+    price_text = " or ".join(price_bits) if price_bits else "Free"
 
     name_line = ""
     if base and upgraded:
@@ -538,24 +591,26 @@ def evolution_embed(item: dict) -> dict:
                 "value": relative_days(evo.get("endSubmissionTime")),
                 "inline": True,
             },
-            {
-                "name": "Requirements",
-                "value": format_kv_lines(evo.get("requirementsText") or []),
-                "inline": False,
-            },
-            {
-                "name": "Upgrades",
-                "value": format_kv_lines(evo.get("totalUpgradesText") or []),
-                "inline": False,
-            },
         ],
     }
+
+    if evo.get("isRepeatable") is not None:
+        embed["fields"].append({
+            "name": "Repeatable",
+            "value": "Yes" if evo.get("isRepeatable") else "No",
+            "inline": True,
+        })
+
+    # Every requirement and every upgrade, across as many fields as it
+    # takes -- see kv_fields().
+    embed["fields"] += kv_fields("Requirements", evo.get("requirementsText") or [])
+    embed["fields"] += kv_fields("Upgrades", evo.get("totalUpgradesText") or [])
+
     if evo.get("url"):
         embed["url"] = f"{FUTGG_BASE}{evo['url']}"
-    if upgraded.get("cardImageUrl"):
-        embed["image"] = {"url": upgraded["cardImageUrl"]}
-    if base.get("cardImageUrl"):
-        embed["thumbnail"] = {"url": base["cardImageUrl"]}
+    # No card art. fut.gg's image is the player BEFORE the evolution, so
+    # showing it next to the upgraded stats invites reading the wrong
+    # numbers -- and it pushed the details themselves off the screen.
     return embed
 
 
